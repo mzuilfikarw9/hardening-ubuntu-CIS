@@ -1,0 +1,25 @@
+---
+# group_vars/k3s_workers.yml
+# Overrides that apply to every host in the [k3s_workers] group across
+# environments (inventoried in both dr.ini and prod.ini).
+
+# Never attempt to `modprobe -r overlayfs` on a k3s worker. k3s uses
+# overlayfs as the storage driver for every running container; unloading
+# the module while containers are running either fails with "Module in
+# use" (best case) or succeeds and corrupts running container state
+# (worst case). The modprobe blacklist file is still written — the module
+# cannot load after next reboot — so the CIS control is satisfied.
+cis_modules_skip_unload:
+  - overlayfs
+
+# Kubernetes REQUIRES the kernel to forward packets between interfaces.
+# Without ip_forward=1, cross-node pod traffic and NodePort routing fail.
+# This directly overrides the CIS L1 recommendation (ip_forward=0) on
+# k3s nodes only. The vendor-scan finding for this key should be
+# accepted as a documented exception for the k3s tier.
+#
+# Discovered 2026-04-20 when ArgoCD (NodePort 30080) on dr-k3s-worker-01
+# became unreachable after the hardening reboot.
+cis_sysctl_overrides:
+  net.ipv4.ip_forward: 1
+  net.ipv6.conf.all.forwarding: 1

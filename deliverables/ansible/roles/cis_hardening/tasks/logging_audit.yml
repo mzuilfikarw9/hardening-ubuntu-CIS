@@ -1,0 +1,156 @@
+---
+- name: Install rsyslog and auditd
+  ansible.builtin.apt:
+    name:
+      - rsyslog
+      - auditd
+      # audispd-plugins was merged into the auditd package on Ubuntu 22.04+
+      # (it still exists on 20.04 and older Debian). Don't re-add it.
+    state: present
+
+- name: Enable and start rsyslog
+  ansible.builtin.systemd:
+    name: rsyslog
+    enabled: true
+    state: started
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: Ensure /etc/systemd/journald.conf.d exists
+  # Minimal Ubuntu images (e.g. the stripped-down k3s workers) ship without
+  # this directory; systemd only creates it when a package drops a file in.
+  # Create it explicitly so the drop-in copy below always succeeds.
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Drop-in journald config
+  # CIS 6.1.2.2 requires ForwardToSyslog=no when rsyslog is the primary
+  # sink (which it is on this fleet — auditd writes to rsyslog, rsyslog
+  # owns /var/log/*). Leaving it "yes" double-writes every journal entry
+  # into rsyslog and also fails the OpenSCAP check. Keep Storage=persistent
+  # for crash forensics and Compress=yes for disk.
+  ansible.builtin.copy:
+    dest: /etc/systemd/journald.conf.d/99-cis.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Journal]
+      Storage=persistent
+      Compress=yes
+      ForwardToSyslog=no
+  notify: restart journald
+
+- name: auditd.conf values
+  ansible.builtin.lineinfile:
+    path: /etc/audit/auditd.conf
+    regexp: "^{{ item.key }}\\s*="
+    line: "{{ item.key }} = {{ item.value }}"
+  loop:
+    - { key: "max_log_file",           value: "{{ cis_audit_max_log_file_mb }}" }
+    - { key: "max_log_file_action",    value: "keep_logs" }
+    - { key: "space_left_action",      value: "email" }
+    - { key: "action_mail_acct",       value: "root" }
+    - { key: "admin_space_left_action", value: "halt" }
+  notify: restart auditd
+  # In --check mode the "Install rsyslog and auditd" task is simulated,
+  # so /etc/audit/auditd.conf doesn't exist yet. Skip in dry-run only.
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: Deploy CIS audit rules
+  ansible.builtin.copy:
+    dest: /etc/audit/rules.d/99-cis.rules
+    owner: root
+    group: root
+    mode: "0640"
+    src: cis-audit.rules
+  notify: restart auditd
+  # Parent /etc/audit/rules.d/ is created by the auditd package, which
+  # is only simulated in --check mode. Tolerate in dry-run.
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: Enable auditd
+  ansible.builtin.systemd:
+    name: auditd
+    enabled: true
+    state: started
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: Install AIDE
+  ansible.builtin.apt:
+    name:
+      - aide
+      - aide-common
+    state: present
+  when: cis_install_aide
+
+# On k3s worker/master nodes the default AIDE config scans containerd
+# overlay layers, kubelet pods, and /var/log — all volatile. That both
+# balloons the initial aideinit runtime (observed: 1–2 hours) and fills
+# the daily diff with noise. Drop a site-local exclusion file so AIDE
+# skips those paths. The file is read alongside the shipped defaults.
+- name: Deploy CIS AIDE exclusions for volatile paths
+  ansible.builtin.copy:
+    dest: /etc/aide/aide.conf.d/99_cis_exclusions
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible cis_hardening role. Do not edit by hand.
+      # Volatile paths that produce noise in daily AIDE diffs and would
+      # otherwise dominate the initial aideinit runtime.
+      !/var/lib/containerd
+      !/var/lib/kubelet
+      !/var/lib/rancher
+      !/run/k3s
+      !/var/log
+      !/var/lib/docker
+      !/var/cache
+      !/tmp
+  when: cis_install_aide
+
+- name: Initialize AIDE database if missing (async, long timeout)
+  # aideinit can take 30+ minutes even with exclusions. Run it async so
+  # Ansible can report progress and the play doesn't appear hung. The
+  # poll: 0 + async: 7200 pattern launches it in the background and we
+  # wait for it with the follow-up task so failures still surface.
+  ansible.builtin.shell: |
+    set -eu
+    if [ ! -f /var/lib/aide/aide.db ]; then
+      aideinit -y -f
+      if [ -f /var/lib/aide/aide.db.new ]; then
+        mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+      fi
+    fi
+  args:
+    executable: /bin/bash
+    creates: /var/lib/aide/aide.db
+  async: 7200    # 2-hour ceiling — generous upper bound
+  poll: 0        # fire and return a job id; we wait below
+  register: aide_init_async
+  when: cis_install_aide
+
+- name: Wait for AIDE initialisation to finish
+  ansible.builtin.async_status:
+    jid: "{{ aide_init_async.ansible_job_id }}"
+  register: aide_init_status
+  until: aide_init_status.finished
+  retries: 240   # 240 * 30s = 2 hours
+  delay: 30
+  when:
+    - cis_install_aide
+    - aide_init_async.ansible_job_id is defined
+    - not (aide_init_async.skipped | default(false))
+
+- name: Schedule daily AIDE check
+  ansible.builtin.copy:
+    dest: /etc/cron.d/aide
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      0 5 * * * root /usr/bin/aide.wrapper --check 2>&1 | /usr/bin/logger -t aide
+  when: cis_install_aide

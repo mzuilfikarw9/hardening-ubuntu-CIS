@@ -1,0 +1,53 @@
+---
+- name: Secure GRUB config file
+  ansible.builtin.file:
+    path: /boot/grub/grub.cfg
+    owner: root
+    group: root
+    mode: "0600"
+  when: ansible_facts.packages.grub2 is defined or ansible_facts.mounts is defined
+
+- name: Remove prelink (deprecated by CIS)
+  ansible.builtin.apt:
+    name: prelink
+    state: absent
+    purge: true
+  # Skip in offline mode (broken apt path to public mirrors).
+  when: not (cis_offline_mode | default(false) | bool)
+
+- name: Deploy CIS sysctl drop-in
+  ansible.builtin.template:
+    src: 60-cis.conf.j2
+    dest: /etc/sysctl.d/60-cis.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: apply sysctl
+
+- name: Disable coredumps via limits.d
+  ansible.builtin.copy:
+    dest: /etc/security/limits.d/99-cis-nocore.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      *      hard   core    0
+
+- name: Ensure systemd coredump drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/coredump.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Tighten systemd coredump
+  ansible.builtin.copy:
+    dest: /etc/systemd/coredump.conf.d/99-cis.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Coredump]
+      Storage=none
+      ProcessSizeMax=0

@@ -1,0 +1,62 @@
+---
+- name: Install UFW
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+  when: cis_firewall == "ufw"
+
+- name: Allow SSH before enabling UFW (avoid lockout)
+  community.general.ufw:
+    rule: allow
+    port: "{{ cis_ssh_port }}"
+    proto: tcp
+  when: cis_firewall == "ufw"
+
+- name: Default-deny incoming
+  community.general.ufw:
+    direction: incoming
+    policy: deny
+  when: cis_firewall == "ufw"
+
+- name: Default-allow outgoing
+  community.general.ufw:
+    direction: outgoing
+    policy: allow
+  when: cis_firewall == "ufw"
+
+- name: Allow loopback in
+  community.general.ufw:
+    rule: allow
+    interface: lo
+    direction: in
+  when: cis_firewall == "ufw"
+
+- name: Allow loopback out
+  community.general.ufw:
+    rule: allow
+    interface: lo
+    direction: out
+  when: cis_firewall == "ufw"
+
+- name: Deny spoofed loopback source
+  community.general.ufw:
+    rule: deny
+    src: "127.0.0.0/8"
+    direction: in
+  when: cis_firewall == "ufw"
+
+- name: Apply extra allow rules
+  community.general.ufw:
+    rule: allow
+    port: "{{ item.split('/')[0] }}"
+    proto: "{{ item.split('/')[1] }}"
+  loop: "{{ cis_extra_allow_ports }}"
+  when:
+    - cis_firewall == "ufw"
+    - cis_extra_allow_ports | length > 0
+
+- name: Enable and start UFW
+  community.general.ufw:
+    state: enabled
+    logging: "on"
+  when: cis_firewall == "ufw"

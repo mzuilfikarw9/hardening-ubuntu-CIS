@@ -1,0 +1,71 @@
+---
+# group_vars/dr/main.yml
+# Non-secret defaults for the DR environment.
+# Secrets live in vault.yml (ansible-vault encrypted — see vault.yml.example).
+
+# ---- Kubernetes ----
+# Path (on the Ansible control node) to the DR kubeconfig. This file is
+# gitignored. It was fetched from dr-k3s-master-01:/etc/rancher/k3s/k3s.yaml
+# with the server field rewritten to https://172.16.202.20:6443.
+dr_kubeconfig: "{{ playbook_dir }}/.dr-kubeconfig"
+
+# ---- Reboot window controls ----
+# Tripwire: if the whole reboot run passes this many minutes, remaining
+# tiers are skipped and we defer to the next weekly window. Matches the
+# "T+40 min stop" agreement with the CTO.
+reboot_tripwire_minutes: 40
+
+# Per-host sanity waits after a reboot. Tuned conservatively; override
+# per-tier if needed.
+reboot_connect_timeout: 60       # max seconds to wait for SSH to return
+reboot_service_settle_seconds: 30  # post-SSH grace period before health checks
+
+# ---- Cluster health expectations ----
+# We expect exactly 3 MySQL GR members and 3 Mongo rs0 members. If a
+# preflight check sees a different number it will fail loud — that's
+# usually drift from the actual topology (like we just found with k3s).
+mysql_gr_expected_members: 3
+# Mongo rs0 is a STRETCHED replica set spanning prod DC + DR site:
+#   - 172.16.102.36/37/38  (production mongos, PRIMARY currently .36)
+#   - 172.16.202.36/37/38  (DR mongos, all SECONDARY)
+# Total members = 6, majority = 4.
+#
+# Implications:
+#   - DR reboot rehearsal (one DR mongo down at a time): 5/6 up, safe.
+#   - Prod reboot Apr 30 (one prod mongo down at a time): 5/6 up, safe
+#     ONLY IF all DR mongos are healthy at start. If a DR mongo is down
+#     during the prod window, we risk 3/6 = no majority = writes stop.
+#
+# Before any reboot window, confirm all 6 members are healthy first
+# (the preflight-check enforces this via mongo_rs_expected_members).
+mongo_rs_expected_members: 6
+rabbit_expected_nodes: 3
+
+# ---- Known-broken pods to ignore in preflight ----
+# Pods whose NAME contains any of these substrings are EXCLUDED from the
+# "non-Running pods" failure check. Use sparingly — each entry is a chronic
+# issue we've decided not to fix before the reboot window. Anything NEW
+# that breaks will still fail the preflight loudly.
+#
+# Format: list of substrings matched against the pod name (column 2 of
+# `kubectl get pods -A --no-headers`).
+#
+# TODO (post-Apr-30): fix kube-state-metrics — in CrashLoopBackOff since
+# ~Jan 2026 (restart count >60 on DR, 89d old). Monitoring gap only;
+# does not affect HIS app workloads.
+k3s_ignored_pod_patterns:
+  - prometheus-kube-state-metrics
+
+# ---- Where to run cluster-level checks from ----
+# Pick a stable host for each cluster's health query. These are
+# inventory hostnames, not IPs.
+#
+# NOTE: only use these in `delegate_to:` inside tasks — NOT in a
+# play's top-level `hosts:` line. Group_vars are not in scope when
+# Ansible parses the `hosts:` pattern (no host has been selected yet).
+# For `hosts:` use the inventory group with an index: `k3s_masters[0]`.
+dr_mysql_probe_host: dr-mysql-01
+dr_mongo_probe_host: dr-mongo-rabbit-01
+dr_rabbit_probe_host: dr-mongo-rabbit-01
+dr_proxysql_probe_host: dr-proxysql-01
+dr_k3s_probe_host: dr-k3s-master-01

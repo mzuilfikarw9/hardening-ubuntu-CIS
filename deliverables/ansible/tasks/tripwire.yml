@@ -1,0 +1,32 @@
+---
+# tasks/tripwire.yml — Enforce the T+N minutes stop rule.
+#
+# Included at the start of each reboot tier. If the cumulative wall-clock
+# time since the run started exceeds `reboot_tripwire_minutes`, we skip
+# the remaining tiers instead of pushing past the maintenance window.
+#
+# The start timestamp is set once by the safety-gate play at the top of
+# reboot-ha.yml; see that file for the authoritative definition.
+
+- name: Compute elapsed minutes
+  ansible.builtin.set_fact:
+    _reboot_elapsed_min: >-
+      {{ (( (lookup('pipe', 'date +%s') | int)
+            - (hostvars['localhost']['reboot_run_start_epoch'] | int)
+          ) / 60) | round(1) }}
+
+- name: Print elapsed time
+  ansible.builtin.debug:
+    msg: >-
+      Tier start. Elapsed since run began: {{ _reboot_elapsed_min }} min
+      (tripwire at {{ reboot_tripwire_minutes }} min).
+
+- name: Abort remaining tiers if tripwire exceeded
+  ansible.builtin.fail:
+    msg: >-
+      Tripwire exceeded ({{ _reboot_elapsed_min }} min >
+      {{ reboot_tripwire_minutes }} min). Stopping per pre-agreed
+      maintenance-window policy. Remaining tiers will run in the next
+      weekly window. Run preflight-check.yml now to confirm what's
+      already rebooted is healthy.
+  when: (_reboot_elapsed_min | float) > (reboot_tripwire_minutes | float)

@@ -1,0 +1,153 @@
+---
+# openscap-scan.yml
+#
+# Runs the CIS Level 1 Server profile against every host in the selected
+# inventory using SCAP Security Guide (SSG) 0.1.80 datastreams. Per-host
+# HTML report + XCCDF results XML are fetched back to the control node
+# under ../openscap/<env>/<hostname>/.
+#
+# Usage:
+#   # DR:
+#   ansible-playbook -i inventories/dr.ini openscap-scan.yml \
+#     --vault-password-file .vault_pass -e scan_env=dr
+#
+#   # Prod (post Apr 30):
+#   ansible-playbook -i inventories/prod.ini openscap-scan.yml \
+#     --vault-password-file .vault_pass -e scan_env=prod
+#
+# Before first run: download SSG 0.1.80 datastreams into ./content/.
+# See content/README.md for exact steps.
+#
+# Notes:
+# - oscap returns rc=2 when rules fail — that's a normal scan outcome,
+#   not a module failure. We treat only rc=1 (scanner error) as failed.
+# - Scan is read-only. Safe to run anytime, including pre-reboot.
+# - Runs in parallel across all hosts (forks limited by ansible.cfg).
+
+- name: OpenSCAP — CIS L1 Server scan
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    ssg_version: "0.1.80"
+    scan_env: "dr"   # override with -e scan_env=prod
+    target_results_dir: /var/lib/openscap-results
+    local_results_root: "{{ playbook_dir }}/../openscap/{{ scan_env }}"
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # 1. Make sure the oscap scanner is installed on the target.
+    # -------------------------------------------------------------------------
+    # Ubuntu 22.04 ships the scanner in libopenscap8; Ubuntu 24.04 splits it
+    # out into openscap-scanner. Pick the right package per version.
+    - name: Select oscap scanner package by Ubuntu version
+      ansible.builtin.set_fact:
+        oscap_pkg: "{{ 'libopenscap8' if ansible_distribution_version == '22.04' else 'openscap-scanner' }}"
+      when: ansible_distribution == 'Ubuntu'
+
+    - name: Ensure oscap scanner is installed
+      ansible.builtin.apt:
+        name: "{{ oscap_pkg }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      when: ansible_distribution == 'Ubuntu'
+
+    # -------------------------------------------------------------------------
+    # 2. Pick the right SSG datastream for this Ubuntu version.
+    #    ansible_distribution_version -> "22.04" or "24.04".
+    #    Filename format: ssg-ubuntu2204-ds.xml / ssg-ubuntu2404-ds.xml
+    # -------------------------------------------------------------------------
+    - name: Select SSG datastream by Ubuntu version
+      ansible.builtin.set_fact:
+        ssg_datastream: >-
+          ssg-ubuntu{{ ansible_distribution_version | replace('.', '') }}-ds.xml
+      when: ansible_distribution == 'Ubuntu'
+
+    - name: Fail early on unsupported distro
+      ansible.builtin.fail:
+        msg: >-
+          This playbook only supports Ubuntu 22.04 and 24.04.
+          Got distribution={{ ansible_distribution }}
+          version={{ ansible_distribution_version }}.
+      when:
+        - ansible_distribution != 'Ubuntu'
+          or ansible_distribution_version not in ['22.04', '24.04']
+
+    # -------------------------------------------------------------------------
+    # 3. Stage the datastream on target.
+    #    We copy from control node to /tmp on target — avoids dependency on
+    #    target Internet access or on ssg-debian apt package availability.
+    # -------------------------------------------------------------------------
+    - name: Create results directory on target
+      ansible.builtin.file:
+        path: "{{ target_results_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Copy SSG datastream to target
+      ansible.builtin.copy:
+        src: "content/{{ ssg_datastream }}"
+        dest: "/tmp/{{ ssg_datastream }}"
+        owner: root
+        group: root
+        mode: '0644'
+
+    # -------------------------------------------------------------------------
+    # 4. Run the scan.
+    # -------------------------------------------------------------------------
+    - name: Run oscap xccdf eval (CIS L1 Server)
+      ansible.builtin.command: >-
+        oscap xccdf eval
+        --profile xccdf_org.ssgproject.content_profile_cis_level1_server
+        --results {{ target_results_dir }}/{{ inventory_hostname }}-results.xml
+        --report  {{ target_results_dir }}/{{ inventory_hostname }}-report.html
+        /tmp/{{ ssg_datastream }}
+      register: oscap_run
+      # rc=0 all pass, rc=2 some rules failed (normal), rc=1 scanner error.
+      failed_when: oscap_run.rc not in [0, 2]
+      changed_when: false
+
+    - name: Summarise oscap exit status
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} — oscap rc={{ oscap_run.rc }}
+          ({{ 'all rules passed' if oscap_run.rc == 0
+               else 'some rules failed (expected, see report)' }})
+
+    # -------------------------------------------------------------------------
+    # 5. Fetch results back to control node.
+    #    flat: true writes to  <local_results_root>/<hostname>/<file>
+    #    without the extra inventory_hostname subdir ansible adds by default.
+    # -------------------------------------------------------------------------
+    - name: Ensure local results directory exists
+      ansible.builtin.file:
+        path: "{{ local_results_root }}/{{ inventory_hostname }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: false
+      run_once: false
+
+    - name: Fetch OpenSCAP HTML report
+      ansible.builtin.fetch:
+        src: "{{ target_results_dir }}/{{ inventory_hostname }}-report.html"
+        dest: "{{ local_results_root }}/{{ inventory_hostname }}/{{ inventory_hostname }}-report.html"
+        flat: true
+
+    - name: Fetch OpenSCAP XCCDF results XML
+      ansible.builtin.fetch:
+        src: "{{ target_results_dir }}/{{ inventory_hostname }}-results.xml"
+        dest: "{{ local_results_root }}/{{ inventory_hostname }}/{{ inventory_hostname }}-results.xml"
+        flat: true
+
+    # -------------------------------------------------------------------------
+    # 6. Clean up staging copy on target (keep /var/lib/openscap-results
+    #    so the host itself retains a local copy for audit).
+    # -------------------------------------------------------------------------
+    - name: Remove staged datastream from /tmp
+      ansible.builtin.file:
+        path: "/tmp/{{ ssg_datastream }}"
+        state: absent

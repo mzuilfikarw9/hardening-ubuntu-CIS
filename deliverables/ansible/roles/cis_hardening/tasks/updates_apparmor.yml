@@ -1,0 +1,46 @@
+---
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Apply security upgrades
+  ansible.builtin.apt:
+    upgrade: safe
+    autoremove: true
+  register: _upgrade
+  retries: 3
+  delay: 15
+  until: _upgrade is succeeded
+
+- name: Install AppArmor and utilities
+  ansible.builtin.apt:
+    name:
+      - apparmor
+      - apparmor-utils
+    state: present
+
+- name: Enable AppArmor in GRUB cmdline
+  ansible.builtin.lineinfile:
+    path: /etc/default/grub
+    regexp: '^GRUB_CMDLINE_LINUX='
+    line: 'GRUB_CMDLINE_LINUX="apparmor=1 security=apparmor audit=1 audit_backlog_limit={{ cis_audit_backlog_limit }}"'
+    backrefs: false
+  notify: update grub
+
+- name: Enable and start AppArmor service
+  ansible.builtin.systemd:
+    name: apparmor
+    enabled: true
+    state: started
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: Enforce all AppArmor profiles (best-effort)
+  ansible.builtin.shell: |
+    set -o pipefail
+    for p in /etc/apparmor.d/*; do
+      [ -f "$p" ] && aa-enforce "$p" 2>/dev/null || true
+    done
+  args:
+    executable: /bin/bash
+  changed_when: false

@@ -1,0 +1,50 @@
+---
+# Only enforces mount options on separate partitions that already exist.
+# Creating fresh /tmp, /var, /var/log, /var/log/audit, /home partitions
+# must happen in the Cloud-init template (see cloud-init/ guide).
+
+- name: Gather mount facts
+  ansible.builtin.setup:
+    gather_subset:
+      - mounts
+
+- name: Build list of existing mount points
+  ansible.builtin.set_fact:
+    _existing_mounts: "{{ ansible_mounts | map(attribute='mount') | list }}"
+
+- name: Ensure hardened mount options on /tmp if separate
+  ansible.posix.mount:
+    path: /tmp
+    src: "{{ (ansible_mounts | selectattr('mount','equalto','/tmp') | list | first).device | default('tmpfs') }}"
+    fstype: "{{ (ansible_mounts | selectattr('mount','equalto','/tmp') | list | first).fstype | default('tmpfs') }}"
+    opts: "defaults,rw,nosuid,nodev,noexec,relatime"
+    state: mounted
+  when: "'/tmp' in _existing_mounts"
+
+- name: Ensure hardened mount options on /dev/shm
+  ansible.posix.mount:
+    path: /dev/shm
+    src: tmpfs
+    fstype: tmpfs
+    opts: "defaults,rw,nosuid,nodev,noexec,relatime"
+    state: mounted
+
+- name: Enforce mount options on other sensitive paths if separate
+  ansible.posix.mount:
+    path: "{{ item.path }}"
+    src: "{{ (ansible_mounts | selectattr('mount','equalto',item.path) | list | first).device }}"
+    fstype: "{{ (ansible_mounts | selectattr('mount','equalto',item.path) | list | first).fstype }}"
+    opts: "{{ item.opts }}"
+    state: mounted
+  loop:
+    - { path: "/home",          opts: "defaults,nodev,nosuid" }
+    - { path: "/var",           opts: "defaults,nodev,nosuid" }
+    - { path: "/var/tmp",       opts: "defaults,nodev,nosuid,noexec" }
+    - { path: "/var/log",       opts: "defaults,nodev,nosuid,noexec" }
+    - { path: "/var/log/audit", opts: "defaults,nodev,nosuid,noexec" }
+  when: item.path in _existing_mounts
+
+- name: Unmask tmp.mount so systemd can mount /tmp at boot
+  ansible.builtin.systemd:
+    name: tmp.mount
+    masked: false

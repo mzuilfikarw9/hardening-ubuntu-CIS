@@ -1,0 +1,50 @@
+---
+- name: Deploy CIS profile defaults (TMOUT and umask)
+  ansible.builtin.copy:
+    dest: /etc/profile.d/99-cis.sh
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      TMOUT={{ cis_tmout }}
+      readonly TMOUT
+      export TMOUT
+      umask {{ cis_umask }}
+
+- name: Find system users with a valid login shell
+  ansible.builtin.shell: |
+    awk -F: '($3<1000)&&($1!="root")&&($7!="/usr/sbin/nologin")&&($7!="/bin/false")&&($7!="/sbin/nologin"){print $1}' /etc/passwd
+  register: _sys_users_shell
+  changed_when: false
+
+- name: Disable login shell on system accounts
+  ansible.builtin.user:
+    name: "{{ item }}"
+    shell: /usr/sbin/nologin
+  loop: "{{ _sys_users_shell.stdout_lines }}"
+  when:
+    - _sys_users_shell.stdout_lines | length > 0
+    # protect cloud-init's default user from being nologin-ed by accident
+    - not ((cloudinit_active | default(true)) and item in ['ubuntu'])
+
+- name: Ensure root has GID 0
+  ansible.builtin.user:
+    name: root
+    group: "0"
+
+- name: Find interactive users and fix home dir perms
+  ansible.builtin.shell: |
+    awk -F: '($3>=1000)&&($1!="nobody"){print $1":"$6}' /etc/passwd
+  register: _regular_users
+  changed_when: false
+
+- name: Enforce 0750 on home directories of regular users
+  ansible.builtin.file:
+    path: "{{ item.split(':')[1] }}"
+    owner: "{{ item.split(':')[0] }}"
+    group: "{{ item.split(':')[0] }}"
+    mode: "0750"
+    state: directory
+  loop: "{{ _regular_users.stdout_lines }}"
+  when: (item.split(':')[1]) is directory
+  failed_when: false

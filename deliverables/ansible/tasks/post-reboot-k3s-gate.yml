@@ -1,0 +1,95 @@
+---
+# tasks/post-reboot-k3s-gate.yml
+#
+# Runs immediately after each k3s host (worker or master) returns from
+# reboot, BEFORE the play uncordons the host or moves to the next one.
+# Catches the specific failure mode that broke DR on 2026-04-20:
+#   - 60-cis.conf set ip_forward=0
+#   - sysctl --system applied at boot picked the wrong value
+#   - k3s NodePort + cross-node pod traffic broke
+#   - The cluster reported nodes "Ready" because kubelet doesn't check
+#     ip_forward, so existing health checks in this play missed it
+#
+# This gate fails-closed on any of:
+#   - net.ipv4.ip_forward != 1 in the running kernel
+#   - net.ipv6.conf.all.forwarding != 1 in the running kernel
+#   - /etc/sysctl.d/99-k3s-overrides.conf missing on disk
+#
+# When it fails, the play halts. Remaining k3s nodes stay un-rebooted.
+# Operator must investigate before continuing — the alternative is
+# rolling the same break across every k3s host.
+#
+# Included by reboot-ha.yml in both k3s_workers and k3s_masters tier
+# blocks, in the `tasks:` section after the "Verify k3s service is
+# active" check and before the `post_tasks:` block.
+
+- name: "Post-reboot k3s gate — verify 99-k3s-overrides.conf is still on disk"
+  ansible.builtin.stat:
+    path: /etc/sysctl.d/99-k3s-overrides.conf
+  register: _k3s_override_file
+  become: true
+
+- name: "Post-reboot k3s gate — fail if override file missing"
+  ansible.builtin.fail:
+    msg: |
+      /etc/sysctl.d/99-k3s-overrides.conf is missing on {{ inventory_hostname }}
+      after reboot. Without this file, /etc/sysctl.d/60-cis.conf wins (sets
+      ip_forward=0) and pod-to-pod networking will break the moment the
+      cluster traffic resumes.
+
+      HALTING the reboot play. Do NOT uncordon this host or proceed to the
+      next host. Remediation:
+        1. Re-run apply-k3s-overrides.yml against this host:
+             ansible-playbook -i inventories/{{ target_env | default('dr') }}.ini \
+               apply-k3s-overrides.yml --limit {{ inventory_hostname }}
+        2. Re-run preflight-ip-forward.yml to verify GREEN
+        3. Resume reboot-ha.yml from the next-host point with --start-at-task
+  when: not _k3s_override_file.stat.exists
+
+- name: "Post-reboot k3s gate — read runtime ip_forward (IPv4)"
+  ansible.builtin.slurp:
+    src: /proc/sys/net/ipv4/ip_forward
+  register: _runtime_v4
+  become: true
+
+- name: "Post-reboot k3s gate — read runtime forwarding (IPv6)"
+  ansible.builtin.slurp:
+    src: /proc/sys/net/ipv6/conf/all/forwarding
+  register: _runtime_v6
+  become: true
+  failed_when: false
+
+- name: "Post-reboot k3s gate — fail if ip_forward != 1"
+  ansible.builtin.fail:
+    msg: |
+      net.ipv4.ip_forward = {{ (_runtime_v4.content | b64decode).strip() }} on
+      {{ inventory_hostname }} after reboot. Expected 1 (Kubernetes pod
+      networking requirement). The 99-k3s-overrides.conf file may be
+      present but not applied — systemd-sysctl may have failed at boot.
+
+      HALTING the reboot play. Investigate before continuing. Quick checks:
+        sudo systemctl status systemd-sysctl
+        sudo journalctl -u systemd-sysctl -n 50
+        sudo sysctl --system 2>&1 | grep -i error
+        cat /etc/sysctl.d/60-cis.conf /etc/sysctl.d/99-k3s-overrides.conf
+  when: ((_runtime_v4.content | b64decode).strip()) != "1"
+
+- name: "Post-reboot k3s gate — fail if IPv6 forwarding != 1"
+  ansible.builtin.fail:
+    msg: |
+      net.ipv6.conf.all.forwarding = {{ (_runtime_v6.content | b64decode).strip() }}
+      on {{ inventory_hostname }} after reboot. Expected 1.
+
+      Less critical than the IPv4 gate (most pod traffic is IPv4) but still
+      a sign the override file isn't applying cleanly. HALTING the play.
+      Same investigation as the IPv4 case above.
+  when:
+    - _runtime_v6.content is defined
+    - ((_runtime_v6.content | b64decode).strip()) != "1"
+
+- name: "Post-reboot k3s gate — record PASS"
+  ansible.builtin.debug:
+    msg: >-
+      Post-reboot k3s gate PASSED on {{ inventory_hostname }}.
+      ip_forward=1, ipv6 forwarding=1, override file in place. Safe to
+      uncordon and proceed to next host.

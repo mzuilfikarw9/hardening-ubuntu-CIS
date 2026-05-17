@@ -1,0 +1,18 @@
+---
+- name: Install sudo
+  ansible.builtin.apt:
+    name: sudo
+    state: present
+
+- name: Deploy CIS sudoers drop-in (validated)
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/99-cis
+    owner: root
+    group: root
+    mode: "0440"
+    validate: "/usr/sbin/visudo -cf %s"
+    content: |
+      Defaults use_pty
+      Defaults logfile="/var/log/sudo.log"
+      Defaults !visiblepw
+      Defaults timestamp_timeout=15

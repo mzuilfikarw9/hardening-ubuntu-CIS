@@ -1,0 +1,23 @@
+---
+# tasks/check-proxysql.yml — Post-reboot ProxySQL backend health.
+# Delegates to the probe ProxySQL host so we always query a node that's up.
+
+- name: Query runtime_mysql_servers (delegated)
+  ansible.builtin.shell: |
+    MYSQL_PWD="{{ vault_proxysql_admin_password }}" mysql \
+      -h 127.0.0.1 -P 6032 \
+      -u {{ vault_proxysql_admin_user }} -N -B \
+      -e "SELECT hostgroup_id, hostname, status FROM runtime_mysql_servers;"
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ dr_proxysql_probe_host }}"
+  register: _px_rows
+  changed_when: false
+  no_log: true
+
+- name: Fail if any backend is not ONLINE
+  ansible.builtin.fail:
+    msg: "ProxySQL backend not ONLINE after {{ inventory_hostname }} rebooted. Stopping."
+  when: _px_rows.stdout_lines
+        | reject('search', '\\bONLINE\\b')
+        | list | length > 0

@@ -1,0 +1,43 @@
+---
+- name: Disable kernel modules (install false + blacklist)
+  # Writing the modprobe drop-in is the authoritative CIS control — once
+  # this file is in place the module cannot load after next reboot.
+  # This step is always attempted, even for modules we won't try to unload.
+  ansible.builtin.copy:
+    dest: "/etc/modprobe.d/{{ item }}.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      install {{ item }} /bin/false
+      blacklist {{ item }}
+  loop: "{{ cis_disable_modules }}"
+
+- name: Unload modules if currently loaded
+  # Best-effort active unload. Wrapped in block/rescue so a transient
+  # become timeout or an in-use module on one item does NOT mark the
+  # host unreachable and skip the remaining hardening tasks.
+  #
+  # Skipped for modules listed in cis_modules_skip_unload — typically
+  # overlayfs on k3s nodes (live container runtime depends on it).
+  # Squashfs is handled specially because on HWE kernels it is built-in,
+  # so modprobe -r returns "FATAL: Module squashfs is builtin".
+  block:
+    - name: Attempt modprobe -r {{ item }}
+      ansible.builtin.command: "modprobe -r {{ item }}"
+      loop: "{{ cis_disable_modules | difference(cis_modules_skip_unload) }}"
+      register: _modunload
+      failed_when: >-
+        _modunload.rc != 0
+        and 'is builtin' not in (_modunload.stderr | default(''))
+        and 'Module' not in (_modunload.stderr | default(''))
+      changed_when: _modunload.rc == 0
+  rescue:
+    - name: Warn that one or more module unloads failed (non-fatal)
+      ansible.builtin.debug:
+        msg: >-
+          One or more kernel module unload attempts failed on
+          {{ inventory_hostname }}. The modprobe blacklist files were
+          still written successfully, so the module cannot load on next
+          reboot. Investigate the specific module after the run if
+          needed. This is non-fatal and the play will continue.

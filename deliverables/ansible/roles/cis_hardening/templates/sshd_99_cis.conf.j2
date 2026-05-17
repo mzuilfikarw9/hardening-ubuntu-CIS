@@ -1,0 +1,26 @@
+# Managed by Ansible (cis_hardening). Do not edit by hand.
+Protocol 2
+LogLevel VERBOSE
+X11Forwarding no
+MaxAuthTries {{ cis_ssh_max_auth_tries }}
+IgnoreRhosts yes
+HostbasedAuthentication no
+PermitRootLogin no
+PermitEmptyPasswords no
+PermitUserEnvironment no
+PasswordAuthentication {{ 'no' if cis_ssh_password_auth | default(false) | bool == false else 'yes' }}
+KbdInteractiveAuthentication no
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group-exchange-sha256
+ClientAliveInterval {{ cis_ssh_client_alive_interval }}
+ClientAliveCountMax {{ cis_ssh_client_alive_count_max }}
+LoginGraceTime {{ cis_ssh_login_grace_time }}
+Banner /etc/issue.net
+UsePAM yes
+AllowTcpForwarding no
+MaxStartups 10:30:60
+MaxSessions 4
+{% if cis_ssh_allow_groups %}
+AllowGroups {{ cis_ssh_allow_groups }}
+{% endif %}

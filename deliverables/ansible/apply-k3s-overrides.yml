@@ -1,0 +1,88 @@
+---
+# apply-k3s-overrides.yml — Land the k3s sysctl override file on every
+# k3s node so it wins over /etc/sysctl.d/60-cis.conf at boot.
+#
+# Why
+# ---
+# DR has /etc/sysctl.d/99-k3s-overrides.conf (origin: manual fix after
+# the 2026-04-20 NodePort outage). Prod does NOT have this file.
+# Without it, the cis_hardening role's 60-cis.conf will set
+# ip_forward=0 on prod k3s nodes, repeating the outage after reboot.
+#
+# This playbook is intentionally narrow:
+#   - hosts: k3s_masters + k3s_workers ONLY
+#   - one file copy
+#   - one sysctl --system reload (so the runtime kernel picks it up
+#     immediately; the value will also persist across reboot)
+#
+# Idempotent — running on DR (where the file already exists with the
+# same content) is a no-op.
+#
+# Usage
+# -----
+#   # Pre-flight to prod (run this in the afternoon before Apr 30 window):
+#   ansible-playbook -i inventories/prod.ini apply-k3s-overrides.yml
+#
+#   # DR re-apply (safe, no-op if file already matches):
+#   ansible-playbook -i inventories/dr.ini   apply-k3s-overrides.yml
+#
+# After this runs, verify with:
+#   ansible-playbook -i inventories/<env>.ini preflight-ip-forward.yml \
+#     -e target_env=<env>
+# All k3s hosts should show GATE=PASS.
+
+- name: Apply k3s sysctl overrides
+  hosts: k3s_masters:k3s_workers
+  become: true
+  gather_facts: false
+  tags: [k3s, sysctl, ip_forward]
+
+  tasks:
+    - name: Deploy /etc/sysctl.d/99-k3s-overrides.conf
+      ansible.builtin.copy:
+        src: files/99-k3s-overrides.conf
+        dest: /etc/sysctl.d/99-k3s-overrides.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: apply sysctl
+
+    # Force handler to flush in case the play exits before the implicit
+    # flush at end-of-play (e.g. if --check is mixed with --diff).
+    - name: Flush handlers now
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verify runtime ip_forward = 1
+      ansible.builtin.command:
+        cmd: sysctl -n net.ipv4.ip_forward
+      register: _v4_runtime
+      changed_when: false
+
+    - name: Verify runtime IPv6 forwarding = 1
+      ansible.builtin.command:
+        cmd: sysctl -n net.ipv6.conf.all.forwarding
+      register: _v6_runtime
+      changed_when: false
+
+    - name: Fail if runtime did not flip to 1
+      ansible.builtin.fail:
+        msg: |
+          k3s override deployed but runtime did not pick up:
+            ip_forward            = {{ _v4_runtime.stdout }}
+            ipv6.all.forwarding   = {{ _v6_runtime.stdout }}
+          Expected both = 1. Investigate `sysctl --system` output and
+          file precedence in /etc/sysctl.d/.
+      when:
+        - _v4_runtime.stdout != "1"
+          or _v6_runtime.stdout != "1"
+
+    - name: Per-host confirmation
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: 99-k3s-overrides.conf in place,
+          ip_forward=1, ipv6 forwarding=1. OK.
+
+  handlers:
+    - name: apply sysctl
+      ansible.builtin.command:
+        cmd: sysctl --system

@@ -1,0 +1,24 @@
+---
+# tasks/check-mongo.yml — Wait for Mongo rs0 to return to expected state.
+# Accepts PRIMARY, SECONDARY, ARBITER as healthy. RECOVERING is expected
+# transiently just after a reboot — we retry while it settles.
+
+- name: rs.status() member states
+  ansible.builtin.shell: |
+    mongosh --quiet \
+      -u '{{ vault_mongo_user }}' \
+      -p '{{ vault_mongo_password }}' \
+      --authenticationDatabase '{{ vault_mongo_auth_db }}' \
+      --eval 'rs.status().members.map(m => m.stateStr).join(",")'
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ dr_mongo_probe_host }}"
+  register: _mongo_states
+  changed_when: false
+  no_log: true
+  until: >-
+    _mongo_states.stdout.strip().split(',') | length == mongo_rs_expected_members
+    and (_mongo_states.stdout.strip().split(',')
+         | reject('in', ['PRIMARY','SECONDARY','ARBITER']) | list | length) == 0
+  retries: 20
+  delay: 15

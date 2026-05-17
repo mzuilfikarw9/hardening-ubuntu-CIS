@@ -1,0 +1,7 @@
+# {{ ansible_managed }}
+# cis_hardening role — sysctl drop-in
+# Values come from cis_sysctl_base (defaults) merged with
+# cis_sysctl_overrides (group_vars). Override wins.
+{% for k, v in (cis_sysctl_base | combine(cis_sysctl_overrides)) | dictsort %}
+{{ k }} = {{ v }}
+{% endfor %}

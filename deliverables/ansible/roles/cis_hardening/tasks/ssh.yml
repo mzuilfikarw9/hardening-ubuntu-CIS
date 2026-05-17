@@ -1,0 +1,53 @@
+---
+- name: Ensure SSH drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/ssh/sshd_config.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy CIS SSHD drop-in
+  ansible.builtin.template:
+    src: sshd_99_cis.conf.j2
+    dest: /etc/ssh/sshd_config.d/99-cis.conf
+    owner: root
+    group: root
+    mode: "0600"
+    validate: "/usr/sbin/sshd -t -f %s"
+  notify: reload sshd
+
+- name: Lock down sshd_config ownership/perms
+  ansible.builtin.file:
+    path: /etc/ssh/sshd_config
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Find SSH private host keys
+  ansible.builtin.find:
+    paths: /etc/ssh
+    patterns: "ssh_host_*_key"
+  register: _ssh_priv
+
+- name: Find SSH public host keys
+  ansible.builtin.find:
+    paths: /etc/ssh
+    patterns: "ssh_host_*_key.pub"
+  register: _ssh_pub
+
+- name: Secure SSH private host keys
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    owner: root
+    group: root
+    mode: "0600"
+  loop: "{{ _ssh_priv.files }}"
+
+- name: Secure SSH public host keys
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ _ssh_pub.files }}"

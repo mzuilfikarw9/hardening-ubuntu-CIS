@@ -1,0 +1,27 @@
+---
+# site.yml
+# Top-level playbook. Targets all CIS-managed Ubuntu hosts and applies the
+# cis_hardening role with OS-aware task includes.
+#
+# Example inventory (inventories/hkl.ini):
+#   [u22]
+#   172.16.102.30
+#   172.16.102.31
+#   ...
+#   [u24]
+#   172.16.102.10
+#   172.16.102.11
+#   ...
+#
+# Run:
+#   ansible-playbook -i inventories/hkl.ini site.yml --check --diff   # dry-run
+#   ansible-playbook -i inventories/hkl.ini site.yml                  # apply
+
+- name: CIS L1 Server hardening (Ubuntu 22.04 and 24.04)
+  hosts: all
+  become: true
+  gather_facts: true
+  any_errors_fatal: false
+  serial: "25%"          # rolling wave of 25% of hosts at a time
+  roles:
+    - role: cis_hardening

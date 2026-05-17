@@ -1,0 +1,24 @@
+---
+# tasks/check-mysql-gr.yml — Wait for MySQL GR to return to full quorum.
+# Checks from the probe host against performance_schema.
+# Healthy = expected member count, all ONLINE, exactly one PRIMARY.
+
+- name: Query replication_group_members
+  ansible.builtin.shell: |
+    MYSQL_PWD="{{ vault_mysql_password }}" mysql \
+      -u {{ vault_mysql_user }} -N -B \
+      -e "SELECT MEMBER_HOST, MEMBER_STATE, MEMBER_ROLE
+          FROM performance_schema.replication_group_members;"
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ dr_mysql_probe_host }}"
+  register: _gr
+  changed_when: false
+  no_log: true
+  until: >-
+    (_gr.stdout_lines | length) == mysql_gr_expected_members
+    and (_gr.stdout_lines | select('search', '\\bONLINE\\b') | list | length)
+          == mysql_gr_expected_members
+    and (_gr.stdout_lines | select('search', '\\bPRIMARY\\b') | list | length) == 1
+  retries: 30
+  delay: 15

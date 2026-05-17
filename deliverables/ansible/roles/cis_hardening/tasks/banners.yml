@@ -1,0 +1,13 @@
+---
+- name: Deploy banner content
+  ansible.builtin.copy:
+    dest: "{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      Authorized users only. All activity may be monitored and reported.
+  loop:
+    - /etc/issue
+    - /etc/issue.net
+    - /etc/motd

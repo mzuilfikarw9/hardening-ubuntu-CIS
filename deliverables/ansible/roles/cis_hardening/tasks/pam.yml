@@ -1,0 +1,55 @@
+---
+- name: Install password quality library
+  ansible.builtin.apt:
+    name: libpam-pwquality
+    state: present
+
+- name: Configure pwquality.conf
+  ansible.builtin.copy:
+    dest: /etc/security/pwquality.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      minlen = {{ cis_pwquality.minlen }}
+      minclass = {{ cis_pwquality.minclass }}
+      dcredit = {{ cis_pwquality.dcredit }}
+      ucredit = {{ cis_pwquality.ucredit }}
+      ocredit = {{ cis_pwquality.ocredit }}
+      lcredit = {{ cis_pwquality.lcredit }}
+      difok = {{ cis_pwquality.difok }}
+      maxrepeat = {{ cis_pwquality.maxrepeat }}
+      maxclassrepeat = {{ cis_pwquality.maxclassrepeat }}
+      enforce_for_root
+
+- name: Configure faillock.conf
+  ansible.builtin.copy:
+    dest: /etc/security/faillock.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      deny = {{ cis_faillock.deny }}
+      unlock_time = {{ cis_faillock.unlock_time }}
+      fail_interval = {{ cis_faillock.fail_interval }}
+
+- name: Enable pwquality and faillock PAM profiles
+  ansible.builtin.shell: |
+    set -o pipefail
+    DEBIAN_FRONTEND=noninteractive pam-auth-update --enable pwquality faillock faillock_notify || true
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Set password-aging defaults in /etc/login.defs
+  ansible.builtin.lineinfile:
+    path: /etc/login.defs
+    regexp: "^{{ item.key }}\\b"
+    line: "{{ item.key }} {{ item.value }}"
+    create: true
+  loop:
+    - { key: "PASS_MAX_DAYS",  value: "{{ cis_pass_max_days }}" }
+    - { key: "PASS_MIN_DAYS",  value: "{{ cis_pass_min_days }}" }
+    - { key: "PASS_WARN_AGE",  value: "{{ cis_pass_warn_age }}" }
+    - { key: "ENCRYPT_METHOD", value: "YESCRYPT" }
+    - { key: "UMASK",          value: "{{ cis_umask }}" }

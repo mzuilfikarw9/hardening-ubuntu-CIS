@@ -1,0 +1,26 @@
+---
+# tasks/check-vip.yml — Confirm exactly one HAProxy node holds the VIP.
+# Run after a haproxy node reboots: keepalived must have settled ownership
+# on either the node that stayed up or (once it returns) the MASTER.
+
+- name: Ask each haproxy node whether it holds the VIP
+  ansible.builtin.shell: |
+    ip -4 -o addr show | grep -q '172.16.202.35' && echo yes || echo no
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['haproxy'] }}"
+  register: _vip_probe
+  changed_when: false
+
+- name: Count holders
+  ansible.builtin.set_fact:
+    _vip_holders: >-
+      {{ _vip_probe.results
+         | selectattr('stdout', 'equalto', 'yes')
+         | map(attribute='item') | list }}
+
+- name: Fail if VIP has zero or >1 holders
+  ansible.builtin.fail:
+    msg: "VIP 172.16.202.35 held by {{ _vip_holders | length }} node(s): {{ _vip_holders }}"
+  when: (_vip_holders | length) != 1

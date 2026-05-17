@@ -1,0 +1,37 @@
+---
+# group_vars/dr/vault.yml.example
+#
+# Template for the encrypted DR secrets file. Copy this to vault.yml,
+# fill in the real values, then encrypt in place:
+#
+#   cp group_vars/dr/vault.yml.example group_vars/dr/vault.yml
+#   # edit group_vars/dr/vault.yml with real secrets
+#   ansible-vault encrypt group_vars/dr/vault.yml
+#
+# After that, run playbooks with:
+#
+#   ansible-playbook -i inventories/dr.ini preflight-check.yml \
+#     --ask-vault-pass
+#
+# Or keep the vault password in a gitignored file and use
+# --vault-password-file .vault_pass.
+#
+# The plaintext vault.yml is gitignored (see project .gitignore).
+
+# ---- MySQL ----
+# Read-only account used for group-replication health queries. Should have
+# SELECT on performance_schema.replication_group_members at minimum.
+vault_mysql_user: "read_only"
+vault_mysql_password: "REPLACE_ME"
+
+# ---- MongoDB ----
+# Admin account on the auth-enabled replica set rs0. We only use it to
+# call rs.status(); no writes are performed by the reboot playbooks.
+vault_mongo_user: "admin"
+vault_mongo_password: "REPLACE_ME"
+vault_mongo_auth_db: "admin"
+
+# ---- ProxySQL ----
+# Default admin:admin today — log a ticket to rotate before prod.
+vault_proxysql_admin_user: "admin"
+vault_proxysql_admin_password: "admin"

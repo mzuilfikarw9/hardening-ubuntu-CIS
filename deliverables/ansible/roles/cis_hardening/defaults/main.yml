@@ -1,0 +1,168 @@
+---
+# defaults/main.yml
+# Tuneables for the cis_hardening role. Override in group_vars/ or host_vars/.
+
+# When true, treat the host as a Proxmox Cloud-init VM and skip changes
+# that would break first-boot provisioning. The role auto-detects cloud-init
+# but you can force the value with this flag.
+cis_cloudinit_managed: true
+
+# Password policy
+cis_pass_max_days: 365
+cis_pass_min_days: 1
+cis_pass_warn_age: 7
+cis_pwquality:
+  minlen: 14
+  minclass: 4
+  dcredit: -1
+  ucredit: -1
+  ocredit: -1
+  lcredit: -1
+  difok: 3
+  maxrepeat: 3
+  maxclassrepeat: 4
+
+# Lockout policy
+cis_faillock:
+  deny: 5
+  unlock_time: 900
+  fail_interval: 900
+
+# Shell session
+cis_tmout: 900
+cis_umask: "027"
+
+# SSH
+cis_ssh_allow_groups: ""          # e.g. "ssh-users admins"; empty = skip
+cis_ssh_client_alive_interval: 300
+cis_ssh_client_alive_count_max: 2
+cis_ssh_max_auth_tries: 4
+cis_ssh_login_grace_time: 60
+# HKL uses Proxmox inline Cloud-init which sets a password on the default
+# `ubuntu` user. If you want to keep password auth as an emergency fallback,
+# set this to true in group_vars/all.yml. Otherwise: key-only (CIS-aligned).
+cis_ssh_password_auth: false
+
+# Firewall
+cis_firewall: ufw                 # ufw | nftables
+cis_ssh_port: 22
+cis_extra_allow_ports: []         # list of "<port>/<proto>" strings, e.g. ["443/tcp"]
+
+# Time sync - defaults align with HKL's internal DNS/gateway at 172.16.102.254.
+# Replace with your real time servers (AD DCs, dedicated chrony hosts, etc.).
+cis_ntp_servers:
+  - 172.16.102.254
+
+# auditd
+cis_audit_backlog_limit: 8192
+cis_audit_max_log_file_mb: 32
+
+# AIDE
+cis_install_aide: true
+
+# Packages to remove if present
+cis_packages_remove:
+  - autofs
+  - avahi-daemon
+  - bind9
+  - cups
+  - dnsmasq
+  - dovecot-imapd
+  - dovecot-pop3d
+  - isc-dhcp-server
+  - nfs-kernel-server
+  - nis
+  - rpcbind
+  - rsh-client
+  - rsync
+  - samba
+  - slapd
+  - snmpd
+  - squid
+  - talk
+  - telnet
+  - tftpd-hpa
+  - vsftpd
+  - xinetd
+  - ypserv
+  - prelink
+  - ldap-utils
+  - ftp
+
+# Kernel modules to disable
+# A modprobe drop-in ("install <mod> /bin/false" + blacklist) is always
+# written for every module in this list — that satisfies the CIS control
+# because the module cannot load on next reboot.
+cis_disable_modules:
+  - cramfs
+  - freevxfs
+  - hfs
+  - hfsplus
+  - jffs2
+  - overlayfs
+  - squashfs
+  - udf
+  - usb-storage
+  - dccp
+  - tipc
+  - rds
+  - sctp
+
+# Modules to skip the active `modprobe -r` step on (blacklist file is still
+# written). Use this to protect modules that are in active use and would
+# destabilise the host if unloaded right now. The k3s groups override this
+# to include overlayfs — see group_vars/*/k3s_*.yml.
+cis_modules_skip_unload: []
+
+# Sysctl settings written to /etc/sysctl.d/60-cis.conf.
+#
+# cis_sysctl_base holds the CIS-recommended baseline. cis_sysctl_overrides
+# is merged on top (override wins) so group_vars can flip individual keys
+# without having to re-declare the whole dict.
+#
+# Why split into base + overrides: Ansible's default hash_behaviour is
+# "replace" — a group_vars dict replaces the entire defaults dict. Using
+# two variables and combining them in the template (via | combine) gives
+# us per-key overrides cleanly.
+#
+# Known overrides:
+#   - k3s_masters / k3s_workers: net.ipv4.ip_forward=1 and
+#     net.ipv6.conf.all.forwarding=1 are REQUIRED for pod networking.
+#     Without them NodePort services are unreachable across nodes.
+cis_sysctl_base:
+  kernel.randomize_va_space: 2
+  fs.suid_dumpable: 0
+  kernel.yama.ptrace_scope: 1
+  net.ipv4.conf.all.send_redirects: 0
+  net.ipv4.conf.default.send_redirects: 0
+  net.ipv4.ip_forward: 0
+  net.ipv6.conf.all.forwarding: 0
+  net.ipv4.conf.all.accept_source_route: 0
+  net.ipv4.conf.default.accept_source_route: 0
+  net.ipv6.conf.all.accept_source_route: 0
+  net.ipv6.conf.default.accept_source_route: 0
+  net.ipv4.conf.all.accept_redirects: 0
+  net.ipv4.conf.default.accept_redirects: 0
+  net.ipv6.conf.all.accept_redirects: 0
+  net.ipv6.conf.default.accept_redirects: 0
+  net.ipv4.conf.all.secure_redirects: 0
+  net.ipv4.conf.default.secure_redirects: 0
+  net.ipv4.conf.all.log_martians: 1
+  net.ipv4.conf.default.log_martians: 1
+  net.ipv4.icmp_echo_ignore_broadcasts: 1
+  net.ipv4.icmp_ignore_bogus_error_responses: 1
+  net.ipv4.conf.all.rp_filter: 1
+  net.ipv4.conf.default.rp_filter: 1
+  net.ipv4.tcp_syncookies: 1
+  net.ipv6.conf.all.accept_ra: 0
+  net.ipv6.conf.default.accept_ra: 0
+
+cis_sysctl_overrides: {}
+
+# Services we want enabled
+cis_services_enabled:
+  - ssh
+  - cron
+  - auditd
+  - rsyslog
+  - ufw

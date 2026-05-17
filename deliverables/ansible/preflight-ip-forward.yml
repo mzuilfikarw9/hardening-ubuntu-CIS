@@ -1,0 +1,253 @@
+---
+# preflight-ip-forward.yml — Standalone safety gate.
+#
+# Verifies that net.ipv4.ip_forward and net.ipv6.conf.all.forwarding are
+# correctly persisted on every host in the target environment BEFORE the
+# reboot window runs. Fails closed: any host with the wrong persisted
+# value blocks the reboot.
+#
+# Why this gate exists
+# --------------------
+# On 2026-04-20 the cis_hardening role applied ip_forward=0 (CIS L1
+# default) to k3s nodes, breaking pod-to-pod networking and ArgoCD
+# NodePort. We added per-group overrides in group_vars/k3s_*.yml so
+# k3s_masters and k3s_workers get ip_forward=1 explicitly. This gate
+# runs BEFORE reboot-ha.yml to confirm the override actually landed in
+# /etc/sysctl.d/60-cis.conf — because rebooting a k3s node with
+# persisted=0 will recreate the same outage.
+#
+# Per-host expectations
+# ---------------------
+#   k3s_masters or k3s_workers  →  v4 = 1 and v6 = 1   (Kubernetes requires)
+#   any other group             →  v4 = 0 and v6 = 0   (CIS 3.3.1 compliant)
+#
+# What it inspects
+# ----------------
+# 1. /etc/sysctl.d/60-cis.conf  (persisted — what applies after reboot)
+# 2. /proc/sys/net/...          (runtime — what the kernel currently has)
+# Persisted is the gate. Runtime drift is reported as a warning only —
+# it gets reconciled by the reboot we're about to do anyway.
+#
+# Usage
+# -----
+#   # DR validation (use this first, before prod):
+#   ansible-playbook -i inventories/dr.ini   preflight-ip-forward.yml -e target_env=dr
+#
+#   # Prod gate (Apr 30 window):
+#   ansible-playbook -i inventories/prod.ini preflight-ip-forward.yml -e target_env=prod
+#
+# Exit code: 0 if green, non-zero if any host fails the gate.
+# Tag:       --tags ip_forward (so it can be chained or skipped via tag).
+
+# -----------------------------------------------------------------------------
+# Play 1: per-host inspection.
+# -----------------------------------------------------------------------------
+- name: Preflight — ip_forward gate (per-host)
+  hosts: "{{ target_env | default('dr') }}"
+  gather_facts: false
+  any_errors_fatal: false
+  tags: [ip_forward, preflight]
+  vars:
+    cis_sysctl_file: /etc/sysctl.d/60-cis.conf
+  tasks:
+
+    # Cheap reachability check first. If a host is down here it'll be
+    # invisible to the aggregation step, so name it explicitly.
+    - name: Ping host
+      ansible.builtin.ping:
+      register: _ip_fwd_ping
+      ignore_unreachable: true
+      ignore_errors: true
+
+    - name: Mark unreachable hosts
+      ansible.builtin.set_fact:
+        _ip_fwd_unreachable: "{{ _ip_fwd_ping is failed or _ip_fwd_ping is unreachable }}"
+
+    # ---- Effective persisted values across /etc/sysctl.d/ -------------------
+    # We don't just look at /etc/sysctl.d/60-cis.conf — what actually applies
+    # at boot is the LAST assignment across all *.conf files in /etc/sysctl.d/
+    # in lexicographic order (systemd-sysctl rule). A higher-priority file
+    # like /etc/sysctl.d/99-k3s-override.conf can flip a value that
+    # 60-cis.conf set the wrong way.
+    #
+    # `*.conf` expands lex-ordered; grep preserves order across files.
+    # Awk strips whitespace; tail -1 picks the last assignment (effective).
+    # Output is exactly "v4=<val> v6=<val>" — either a digit or "missing".
+    - name: Read effective persisted ip_forward values
+      ansible.builtin.shell: |
+        set -o pipefail
+        DIR=/etc/sysctl.d
+        if ! ls "$DIR"/*.conf >/dev/null 2>&1; then
+          echo "v4=missing v6=missing"
+          exit 0
+        fi
+        V4=$(grep -h '^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=' "$DIR"/*.conf 2>/dev/null \
+             | awk -F= '{gsub(/[[:space:]]/,"",$2);print $2}' | tail -1)
+        V6=$(grep -h '^[[:space:]]*net\.ipv6\.conf\.all\.forwarding[[:space:]]*=' "$DIR"/*.conf 2>/dev/null \
+             | awk -F= '{gsub(/[[:space:]]/,"",$2);print $2}' | tail -1)
+        echo "v4=${V4:-missing} v6=${V6:-missing}"
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: _persisted
+      become: true
+      when: not _ip_fwd_unreachable
+
+    # ---- Runtime kernel values ---------------------------------------------
+    - name: Read runtime IPv4 ip_forward
+      ansible.builtin.slurp:
+        src: /proc/sys/net/ipv4/ip_forward
+      register: _runtime_v4
+      become: true
+      when: not _ip_fwd_unreachable
+
+    - name: Read runtime IPv6 forwarding
+      ansible.builtin.slurp:
+        src: /proc/sys/net/ipv6/conf/all/forwarding
+      register: _runtime_v6
+      become: true
+      failed_when: false
+      when: not _ip_fwd_unreachable
+
+    # ---- Classify host + compute expected/actual ---------------------------
+    # awk emits exactly "v4=<val> v6=<val>" on a single stdout line, where
+    # <val> is either a digit or the literal string "missing". Splitting on
+    # whitespace then on '=' is more robust than a regex with optional
+    # capture groups — if either key is absent we still get "missing"
+    # rather than a None that breaks downstream comparisons.
+    # IMPORTANT: every value below is forced through `| string` so the
+    # downstream comparisons work. Without this, Ansible auto-types "0" /
+    # "1" to integers in some places and strings in others, and `0 == "0"`
+    # is False — which makes the gate fail every host.
+    - name: Classify host and compute values
+      ansible.builtin.set_fact:
+        _is_k3s: "{{ ('k3s_masters' in group_names) or ('k3s_workers' in group_names) }}"
+        _persisted_v4: >-
+          {{ ((_persisted.stdout.split()[0].split('=')[1]) | string)
+             if (_persisted.stdout.split() | length) >= 1 else 'missing' }}
+        _persisted_v6: >-
+          {{ ((_persisted.stdout.split()[1].split('=')[1]) | string)
+             if (_persisted.stdout.split() | length) >= 2 else 'missing' }}
+        _runtime_v4_val: "{{ ((_runtime_v4.content | b64decode).strip()) | string }}"
+        _runtime_v6_val: >-
+          {{ (((_runtime_v6.content | b64decode).strip()) | string)
+             if (_runtime_v6.content is defined) else 'unread' }}
+      when: not _ip_fwd_unreachable
+
+    - name: Determine expected values
+      ansible.builtin.set_fact:
+        _expected_v4: "{{ ('1' if _is_k3s else '0') | string }}"
+        _expected_v6: "{{ ('1' if _is_k3s else '0') | string }}"
+      when: not _ip_fwd_unreachable
+
+    - name: Compute pass/fail
+      ansible.builtin.set_fact:
+        _ip_fwd_ok: >-
+          {{ (_persisted_v4 | string) == (_expected_v4 | string)
+             and (_persisted_v6 | string) == (_expected_v6 | string) }}
+        _ip_fwd_runtime_drift: >-
+          {{ ((_runtime_v4_val | string) != (_expected_v4 | string))
+             or ((_runtime_v6_val | string) != 'unread'
+                 and (_runtime_v6_val | string) != (_expected_v6 | string)) }}
+      when: not _ip_fwd_unreachable
+
+    - name: Per-host status
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          role={{ 'k3s' if _is_k3s else 'non-k3s' }}
+          v4 expected={{ _expected_v4 }} persisted={{ _persisted_v4 }} runtime={{ _runtime_v4_val }} |
+          v6 expected={{ _expected_v6 }} persisted={{ _persisted_v6 }} runtime={{ _runtime_v6_val }} |
+          GATE={{ 'PASS' if _ip_fwd_ok else 'FAIL' }}
+          {% if _ip_fwd_runtime_drift %}(runtime drift, will reconcile on reboot){% endif %}
+      when: not _ip_fwd_unreachable
+
+# -----------------------------------------------------------------------------
+# Play 2: aggregate + go/no-go on localhost.
+# -----------------------------------------------------------------------------
+- name: Preflight — ip_forward gate (aggregate)
+  hosts: localhost
+  gather_facts: false
+  tags: [ip_forward, preflight]
+  vars:
+    _env: "{{ target_env | default('dr') }}"
+  tasks:
+    - name: Build unreachable-hosts list
+      ansible.builtin.set_fact:
+        _unreachable: >-
+          {{ groups[_env]
+             | map('extract', hostvars)
+             | selectattr('_ip_fwd_unreachable', 'defined')
+             | selectattr('_ip_fwd_unreachable')
+             | map(attribute='inventory_hostname')
+             | list }}
+
+    - name: Build failing-hosts list
+      ansible.builtin.set_fact:
+        _failing_hosts: >-
+          {{ groups[_env]
+             | map('extract', hostvars)
+             | selectattr('_ip_fwd_ok', 'defined')
+             | rejectattr('_ip_fwd_ok')
+             | map(attribute='inventory_hostname')
+             | list }}
+        _drift_hosts: >-
+          {{ groups[_env]
+             | map('extract', hostvars)
+             | selectattr('_ip_fwd_runtime_drift', 'defined')
+             | selectattr('_ip_fwd_runtime_drift')
+             | map(attribute='inventory_hostname')
+             | list }}
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "ip_forward gate ({{ _env }}):"
+          - "  total hosts:        {{ groups[_env] | length }}"
+          - "  unreachable:        {{ _unreachable | length }} {{ _unreachable }}"
+          - "  failing the gate:   {{ _failing_hosts | length }} {{ _failing_hosts }}"
+          - "  runtime drift only: {{ _drift_hosts | length }} {{ _drift_hosts }}"
+
+    - name: Block reboot if any host is unreachable
+      ansible.builtin.fail:
+        msg: |
+          Cannot run the gate — {{ _unreachable | length }} host(s) unreachable:
+            {{ _unreachable | join(', ') }}
+          Fix SSH/VPN before proceeding to reboot-ha.yml.
+      when: _unreachable | length > 0
+
+    - name: Block reboot if any host fails the persisted-value check
+      ansible.builtin.fail:
+        msg: |
+          ip_forward gate FAILED on {{ _failing_hosts | length }} host(s):
+            {{ _failing_hosts | join(', ') }}
+
+          Expected per role:
+            k3s_masters / k3s_workers  →  net.ipv4.ip_forward = 1
+                                          net.ipv6.conf.all.forwarding = 1
+            other groups               →  both = 0   (CIS 3.3.1)
+
+          Investigate on a failing host:
+            grep -E 'ip_forward|forwarding' /etc/sysctl.d/60-cis.conf
+
+          If the values are wrong, re-run the cis_hardening role with the
+          correct group_vars BEFORE attempting the reboot:
+            ansible-playbook -i inventories/{{ _env }}.ini site.yml \
+              --limit '{{ _failing_hosts | join(":") }}' \
+              --tags 'process_hardening,sysctl'
+
+          Then re-run this gate:
+            ansible-playbook -i inventories/{{ _env }}.ini \
+              preflight-ip-forward.yml -e target_env={{ _env }}
+      when: _failing_hosts | length > 0
+
+    - name: Green-light banner
+      ansible.builtin.debug:
+        msg: >-
+          ip_forward gate: GREEN.
+          {{ groups[_env] | length }} host(s) verified.
+          {% if _drift_hosts | length > 0 %}
+          ({{ _drift_hosts | length }} host(s) have runtime/persisted drift —
+          reboot will reconcile.)
+          {% endif %}
+          Safe to proceed to preflight-check.yml and reboot-ha.yml.

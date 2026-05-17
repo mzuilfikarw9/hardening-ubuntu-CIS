@@ -1,0 +1,352 @@
+---
+# reboot-ha.yml — HA-aware sequential reboot orchestrator.
+#
+# Reboots the fleet one host at a time per tier, in a deliberate outer-to-
+# inner order so no cluster ever loses quorum:
+#
+#   Tier order (inner → outer is reversed for reboot: we drain edge first,
+#   then move inward; see PRODUCTION_ROLLOUT_PLAN.md for the rationale):
+#
+#     1. proxysql     (2 nodes, one at a time, ProxySQL VIP keeps traffic)
+#     2. haproxy      (2 nodes, one at a time, keepalived VIP fails over)
+#     3. k3s_workers  (5 nodes, one at a time, pods drain/reschedule)
+#     4. k3s_masters  (3 nodes, one at a time, Raft tolerates 1 down)
+#     5. mongo_rabbit (3 nodes, one at a time, both Raft/replset tolerate 1)
+#     6. mysql        (3 nodes, one at a time, GR Paxos tolerates 1)
+#
+# HARD REQUIREMENTS before running:
+#   - preflight-check.yml passed (all tiers green)
+#   - You pass `-e confirm_reboot=YES` on the CLI
+#   - You have Proxmox console access ready as a fallback
+#
+# Tripwire: each play records the wall-clock start of the whole run; if
+# the cumulative minutes exceed `reboot_tripwire_minutes` (default 40),
+# remaining tiers are skipped. Matches the CTO's "T+40 stop and defer"
+# agreement. You can override with `-e reboot_tripwire_minutes=60`.
+#
+# Usage:
+#   # Dress rehearsal on DR (full run):
+#   ansible-playbook -i inventories/dr.ini reboot-ha.yml \
+#     -e confirm_reboot=YES --ask-vault-pass --diff
+#
+#   # Limit to one tier (e.g. test workers only):
+#   ansible-playbook -i inventories/dr.ini reboot-ha.yml \
+#     -e confirm_reboot=YES --ask-vault-pass \
+#     --tags proxysql,haproxy
+#
+# DO NOT RUN AGAINST PRODUCTION WITHOUT A COMPLETED DR DRESS REHEARSAL.
+
+# =============================================================================
+# Safety gate.
+# =============================================================================
+- name: Reboot — safety gate
+  hosts: localhost
+  gather_facts: false
+  tags: always
+  tasks:
+    - name: Require explicit confirmation
+      ansible.builtin.assert:
+        that:
+          - confirm_reboot is defined
+          - confirm_reboot == 'YES'
+        fail_msg: >-
+          Pass `-e confirm_reboot=YES` to authorise a reboot run.
+          (This gate prevents accidental reboots from mis-typed commands.)
+
+    - name: Stamp start time
+      ansible.builtin.set_fact:
+        reboot_run_start_epoch: "{{ lookup('pipe', 'date +%s') }}"
+      run_once: true
+
+    - name: Announce run
+      ansible.builtin.debug:
+        msg: >-
+          Reboot run authorised. Tripwire set to
+          {{ reboot_tripwire_minutes }} minutes. Start:
+          {{ lookup('pipe', 'date -Iseconds') }}.
+
+# =============================================================================
+# Re-usable handler pattern:
+#   For each host in a tier we:
+#     1. Record the reboot start
+#     2. Issue `reboot` via the ansible.builtin.reboot module (which handles
+#        SSH reconnect waiting automatically)
+#     3. Post-reboot: delegate a cluster-level health check to the probe host
+#     4. If health check fails → pause the play and surface an error
+#   Each play defines its own post-reboot check block so the checks stay
+#   close to the tier they care about.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Tier 1: ProxySQL (edge traffic path to DB). Reboot one at a time.
+# Backend DB connections failover within ProxySQL; its own VIP (if keepalived
+# is in use) or DNS round-robin handles client-side.
+# -----------------------------------------------------------------------------
+- name: Reboot — ProxySQL tier
+  hosts: proxysql
+  gather_facts: false
+  serial: 1
+  become: true
+  tags: [proxysql, tier1]
+  pre_tasks:
+    - name: Tripwire check
+      ansible.builtin.include_tasks: tasks/tripwire.yml
+
+  tasks:
+    - name: Reboot {{ inventory_hostname }}
+      ansible.builtin.reboot:
+        msg: "Reboot initiated by reboot-ha.yml (CIS hardening)"
+        connect_timeout: "{{ reboot_connect_timeout }}"
+        reboot_timeout: 600
+        pre_reboot_delay: 5
+        post_reboot_delay: "{{ reboot_service_settle_seconds }}"
+        test_command: systemctl is-system-running --wait || true
+
+    - name: Verify proxysql is active
+      ansible.builtin.command: systemctl is-active proxysql
+      changed_when: false
+      register: proxysql_svc
+      failed_when: proxysql_svc.stdout != 'active'
+
+  post_tasks:
+    - name: Re-check ProxySQL backends healthy
+      ansible.builtin.include_tasks: tasks/check-proxysql.yml
+
+# -----------------------------------------------------------------------------
+# Tier 2: HAProxy + keepalived. One at a time so the VIP always has a home.
+# -----------------------------------------------------------------------------
+- name: Reboot — HAProxy tier
+  hosts: haproxy
+  gather_facts: false
+  serial: 1
+  become: true
+  tags: [haproxy, tier2]
+  pre_tasks:
+    - name: Tripwire check
+      ansible.builtin.include_tasks: tasks/tripwire.yml
+
+  tasks:
+    - name: Reboot {{ inventory_hostname }}
+      ansible.builtin.reboot:
+        msg: "Reboot initiated by reboot-ha.yml (CIS hardening)"
+        connect_timeout: "{{ reboot_connect_timeout }}"
+        reboot_timeout: 600
+        pre_reboot_delay: 5
+        post_reboot_delay: "{{ reboot_service_settle_seconds }}"
+
+    - name: Verify haproxy + keepalived are active
+      ansible.builtin.command: "systemctl is-active {{ item }}"
+      changed_when: false
+      register: svc_active
+      failed_when: svc_active.stdout != 'active'
+      loop:
+        - haproxy
+        - keepalived
+
+  post_tasks:
+    - name: Re-check VIP has exactly one holder
+      ansible.builtin.include_tasks: tasks/check-vip.yml
+
+# -----------------------------------------------------------------------------
+# Tier 3: k3s workers. Cordon + drain before reboot, uncordon after.
+# -----------------------------------------------------------------------------
+- name: Reboot — k3s workers tier
+  hosts: k3s_workers
+  gather_facts: false
+  serial: 1
+  become: true
+  tags: [k3s-workers, tier3]
+  pre_tasks:
+    - name: Tripwire check
+      ansible.builtin.include_tasks: tasks/tripwire.yml
+
+    - name: Cordon {{ inventory_hostname }}
+      ansible.builtin.command: >-
+        kubectl cordon {{ inventory_hostname }}
+      delegate_to: "{{ dr_k3s_probe_host }}"
+      changed_when: true
+
+    - name: Drain {{ inventory_hostname }}
+      ansible.builtin.command: >-
+        kubectl drain {{ inventory_hostname }}
+        --ignore-daemonsets --delete-emptydir-data --force
+        --grace-period=60 --timeout=5m
+      delegate_to: "{{ dr_k3s_probe_host }}"
+      changed_when: true
+
+  tasks:
+    - name: Reboot {{ inventory_hostname }}
+      ansible.builtin.reboot:
+        msg: "Reboot initiated by reboot-ha.yml (CIS hardening)"
+        connect_timeout: "{{ reboot_connect_timeout }}"
+        reboot_timeout: 900
+        pre_reboot_delay: 5
+        post_reboot_delay: "{{ reboot_service_settle_seconds }}"
+
+    - name: Verify k3s-agent is active
+      ansible.builtin.command: systemctl is-active k3s-agent
+      changed_when: false
+      register: k3s_agent_svc
+      failed_when: k3s_agent_svc.stdout != 'active'
+
+    # Defense-in-depth: catches the DR Apr 20 failure mode (ip_forward=0
+    # after sysctl --system on boot). Halts the play before we uncordon
+    # this host or move to the next k3s node. See tasks/post-reboot-k3s-gate.yml.
+    - name: Post-reboot k3s gate (ip_forward + override file)
+      ansible.builtin.include_tasks: tasks/post-reboot-k3s-gate.yml
+
+  post_tasks:
+    - name: Uncordon {{ inventory_hostname }}
+      ansible.builtin.command: >-
+        kubectl uncordon {{ inventory_hostname }}
+      delegate_to: "{{ dr_k3s_probe_host }}"
+      changed_when: true
+
+    - name: Wait for node to be Ready
+      ansible.builtin.shell: |
+        set -o pipefail
+        kubectl get node {{ inventory_hostname }} \
+          -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}'
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ dr_k3s_probe_host }}"
+      register: node_ready
+      until: node_ready.stdout == 'True'
+      retries: 20
+      delay: 15
+      changed_when: false
+
+    - name: Re-check cluster-wide pod state
+      ansible.builtin.include_tasks: tasks/check-k3s-pods.yml
+
+# -----------------------------------------------------------------------------
+# Tier 4: k3s masters. Raft/etcd tolerates 1 of 3 down. Reboot one at a time
+# and wait for etcd quorum to stabilise before the next.
+# -----------------------------------------------------------------------------
+- name: Reboot — k3s masters tier
+  hosts: k3s_masters
+  gather_facts: false
+  serial: 1
+  become: true
+  tags: [k3s-masters, tier4]
+  pre_tasks:
+    - name: Tripwire check
+      ansible.builtin.include_tasks: tasks/tripwire.yml
+
+  tasks:
+    - name: Reboot {{ inventory_hostname }}
+      ansible.builtin.reboot:
+        msg: "Reboot initiated by reboot-ha.yml (CIS hardening)"
+        connect_timeout: "{{ reboot_connect_timeout }}"
+        reboot_timeout: 900
+        pre_reboot_delay: 5
+        post_reboot_delay: "{{ reboot_service_settle_seconds }}"
+
+    - name: Verify k3s is active (master)
+      ansible.builtin.command: systemctl is-active k3s
+      changed_when: false
+      register: k3s_svc
+      failed_when: k3s_svc.stdout != 'active'
+
+    # Defense-in-depth: catches the DR Apr 20 failure mode on master nodes too.
+    # If ip_forward came back wrong on this master, kube-proxy's iptables
+    # rules are wrong and inter-pod routing fails. Halt before next master.
+    - name: Post-reboot k3s gate (ip_forward + override file)
+      ansible.builtin.include_tasks: tasks/post-reboot-k3s-gate.yml
+
+  post_tasks:
+    - name: Wait for API server to respond
+      ansible.builtin.command: kubectl get --raw=/livez
+      changed_when: false
+      register: livez
+      until: livez.rc == 0 and 'ok' in livez.stdout
+      retries: 20
+      delay: 10
+      become: true
+
+    - name: Re-check k3s cluster health
+      ansible.builtin.include_tasks: tasks/check-k3s-cluster.yml
+
+# -----------------------------------------------------------------------------
+# Tier 5: Mongo + Rabbit on the same 3 VMs. Reboot one at a time, verify
+# BOTH rs0 and rabbit clusters recover before the next.
+# -----------------------------------------------------------------------------
+- name: Reboot — Mongo + Rabbit tier
+  hosts: mongo_rabbit
+  gather_facts: false
+  serial: 1
+  become: true
+  tags: [mongo-rabbit, tier5]
+  pre_tasks:
+    - name: Tripwire check
+      ansible.builtin.include_tasks: tasks/tripwire.yml
+
+  tasks:
+    - name: Reboot {{ inventory_hostname }}
+      ansible.builtin.reboot:
+        msg: "Reboot initiated by reboot-ha.yml (CIS hardening)"
+        connect_timeout: "{{ reboot_connect_timeout }}"
+        reboot_timeout: 900
+        pre_reboot_delay: 5
+        post_reboot_delay: "{{ reboot_service_settle_seconds }}"
+
+    - name: Verify mongod + rabbitmq-server active
+      ansible.builtin.command: "systemctl is-active {{ item }}"
+      changed_when: false
+      register: mr_svc
+      failed_when: mr_svc.stdout != 'active'
+      loop:
+        - mongod
+        - rabbitmq-server
+
+  post_tasks:
+    - name: Re-check Mongo rs0
+      ansible.builtin.include_tasks: tasks/check-mongo.yml
+    - name: Re-check RabbitMQ
+      ansible.builtin.include_tasks: tasks/check-rabbit.yml
+
+# -----------------------------------------------------------------------------
+# Tier 6: MySQL Group Replication. Paxos tolerates 1 of 3 down. Reboot one
+# at a time; wait for GR to report all ONLINE before the next.
+# -----------------------------------------------------------------------------
+- name: Reboot — MySQL GR tier
+  hosts: mysql
+  gather_facts: false
+  serial: 1
+  become: true
+  tags: [mysql, tier6]
+  pre_tasks:
+    - name: Tripwire check
+      ansible.builtin.include_tasks: tasks/tripwire.yml
+
+  tasks:
+    - name: Reboot {{ inventory_hostname }}
+      ansible.builtin.reboot:
+        msg: "Reboot initiated by reboot-ha.yml (CIS hardening)"
+        connect_timeout: "{{ reboot_connect_timeout }}"
+        reboot_timeout: 900
+        pre_reboot_delay: 5
+        post_reboot_delay: "{{ reboot_service_settle_seconds }}"
+
+    - name: Verify mysql is active
+      ansible.builtin.command: systemctl is-active mysql
+      changed_when: false
+      register: mysql_svc
+      failed_when: mysql_svc.stdout != 'active'
+
+  post_tasks:
+    - name: Re-check MySQL GR
+      ansible.builtin.include_tasks: tasks/check-mysql-gr.yml
+
+# =============================================================================
+# Done.
+# =============================================================================
+- name: Reboot — run complete
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Success banner
+      ansible.builtin.debug:
+        msg: >-
+          Reboot run finished. Run preflight-check.yml one more time to
+          confirm all tiers are green, then close the change ticket.

@@ -1,0 +1,42 @@
+---
+- name: Lock down /etc/passwd and backups
+  ansible.builtin.file:
+    path: "{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - /etc/passwd
+    - /etc/passwd-
+    - /etc/group
+    - /etc/group-
+  failed_when: false
+
+- name: Lock down /etc/shadow and /etc/gshadow
+  ansible.builtin.file:
+    path: "{{ item }}"
+    owner: root
+    group: shadow
+    mode: "0640"
+  loop:
+    - /etc/shadow
+    - /etc/shadow-
+    - /etc/gshadow
+    - /etc/gshadow-
+  failed_when: false
+
+- name: Lock down /etc/security/opasswd
+  ansible.builtin.file:
+    path: /etc/security/opasswd
+    owner: root
+    group: root
+    mode: "0600"
+  failed_when: false
+
+- name: Tighten log directory perms
+  ansible.builtin.shell: |
+    find /var/log -type d -exec chmod g-w,o-rwx {} +
+    find /var/log -type f -exec chmod g-wx,o-rwx {} +
+  args:
+    executable: /bin/bash
+  changed_when: false

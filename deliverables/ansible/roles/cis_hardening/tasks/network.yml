@@ -1,0 +1,8 @@
+---
+# Network sysctl values are applied via the 60-cis.conf file created in
+# process_hardening.yml. This file only exists to trigger the handler and
+# keep the role structure mirroring the CIS section numbers.
+
+- name: Apply sysctl settings now
+  ansible.builtin.command: sysctl --system
+  changed_when: false

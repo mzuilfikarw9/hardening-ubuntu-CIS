@@ -1,0 +1,204 @@
+## template: jinja
+#cloud-config
+# HKL hardened Cloud-init user-data for Proxmox Ubuntu 22.04/24.04 templates.
+# Place in your Proxmox template's Cloud-init user section, or snippet path
+# (e.g. /var/lib/vz/snippets/user-data-hardened.yaml) and reference from the
+# template with `qm set <vmid> --cicustom "user=local:snippets/user-data-hardened.yaml"`.
+#
+# DESIGN NOTES
+#   - The default Cloud-init user is NOT locked. On first boot it still needs
+#     to accept the SSH key. PermitRootLogin is kept 'no' to match CIS 5.1.x.
+#   - Partitions for /var, /var/log, /var/log/audit, /tmp, /home are NOT
+#     created by cloud-init directly (that is done in the template image).
+#     This file only applies the mount options and idempotent OS hardening.
+#   - UFW is enabled last, after SSH is confirmed allowed, to avoid lockouts.
+
+hostname: "{{ v1.local_hostname | default('ubuntu-cis') }}"
+manage_etc_hosts: true
+timezone: Asia/Kuala_Lumpur
+locale: en_US.UTF-8
+
+package_update: true
+package_upgrade: true
+package_reboot_if_required: true
+
+packages:
+  - apparmor
+  - apparmor-utils
+  - auditd
+  # audispd-plugins merged into auditd on Ubuntu 22.04+ (not a separate pkg).
+  - aide
+  - aide-common
+  - chrony
+  - libpam-pwquality
+  - rsyslog
+  - sudo
+  - ufw
+  - unattended-upgrades
+
+users:
+  - name: ops
+    gecos: "HKL Operations"
+    groups: [sudo, adm]
+    shell: /bin/bash
+    lock_passwd: true
+    sudo: "ALL=(ALL) NOPASSWD:ALL"          # adjust to your policy
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAA...REPLACE_ME...    # paste your ops public key(s)
+
+ntp:
+  enabled: true
+  ntp_client: chrony
+  servers:
+    - 172.16.102.254                # HKL internal gateway/time source
+
+ssh_pwauth: false
+disable_root: true
+
+write_files:
+  - path: /etc/issue
+    owner: root:root
+    permissions: "0644"
+    content: |
+      Authorized users only. All activity may be monitored and reported.
+  - path: /etc/issue.net
+    owner: root:root
+    permissions: "0644"
+    content: |
+      Authorized users only. All activity may be monitored and reported.
+  - path: /etc/motd
+    owner: root:root
+    permissions: "0644"
+    content: |
+      Authorized users only. All activity may be monitored and reported.
+
+  # SSH hardening drop-in (loaded by sshd via /etc/ssh/sshd_config.d/*.conf)
+  - path: /etc/ssh/sshd_config.d/99-cis.conf
+    owner: root:root
+    permissions: "0600"
+    content: |
+      Protocol 2
+      LogLevel VERBOSE
+      X11Forwarding no
+      MaxAuthTries 4
+      IgnoreRhosts yes
+      HostbasedAuthentication no
+      PermitRootLogin no
+      PermitEmptyPasswords no
+      PermitUserEnvironment no
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+      MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com
+      KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group-exchange-sha256
+      ClientAliveInterval 300
+      ClientAliveCountMax 2
+      LoginGraceTime 60
+      Banner /etc/issue.net
+      UsePAM yes
+      AllowTcpForwarding no
+      MaxStartups 10:30:60
+      MaxSessions 4
+
+  - path: /etc/sysctl.d/60-cis.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      kernel.randomize_va_space = 2
+      fs.suid_dumpable = 0
+      kernel.yama.ptrace_scope = 1
+      net.ipv4.conf.all.send_redirects = 0
+      net.ipv4.conf.default.send_redirects = 0
+      net.ipv4.ip_forward = 0
+      net.ipv6.conf.all.forwarding = 0
+      net.ipv4.conf.all.accept_source_route = 0
+      net.ipv4.conf.default.accept_source_route = 0
+      net.ipv6.conf.all.accept_source_route = 0
+      net.ipv6.conf.default.accept_source_route = 0
+      net.ipv4.conf.all.accept_redirects = 0
+      net.ipv4.conf.default.accept_redirects = 0
+      net.ipv6.conf.all.accept_redirects = 0
+      net.ipv6.conf.default.accept_redirects = 0
+      net.ipv4.conf.all.secure_redirects = 0
+      net.ipv4.conf.default.secure_redirects = 0
+      net.ipv4.conf.all.log_martians = 1
+      net.ipv4.conf.default.log_martians = 1
+      net.ipv4.icmp_echo_ignore_broadcasts = 1
+      net.ipv4.icmp_ignore_bogus_error_responses = 1
+      net.ipv4.conf.all.rp_filter = 1
+      net.ipv4.conf.default.rp_filter = 1
+      net.ipv4.tcp_syncookies = 1
+      net.ipv6.conf.all.accept_ra = 0
+      net.ipv6.conf.default.accept_ra = 0
+
+  - path: /etc/sudoers.d/99-cis
+    owner: root:root
+    permissions: "0440"
+    content: |
+      Defaults use_pty
+      Defaults logfile="/var/log/sudo.log"
+      Defaults !visiblepw
+      Defaults timestamp_timeout=15
+
+  - path: /etc/profile.d/99-cis.sh
+    owner: root:root
+    permissions: "0644"
+    content: |
+      TMOUT=900
+      readonly TMOUT
+      export TMOUT
+      umask 027
+
+  - path: /etc/modprobe.d/cis-modules.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      install cramfs /bin/false
+      blacklist cramfs
+      install freevxfs /bin/false
+      blacklist freevxfs
+      install hfs /bin/false
+      blacklist hfs
+      install hfsplus /bin/false
+      blacklist hfsplus
+      install jffs2 /bin/false
+      blacklist jffs2
+      install overlayfs /bin/false
+      blacklist overlayfs
+      install squashfs /bin/false
+      blacklist squashfs
+      install udf /bin/false
+      blacklist udf
+      install usb-storage /bin/false
+      blacklist usb-storage
+      install dccp /bin/false
+      blacklist dccp
+      install tipc /bin/false
+      blacklist tipc
+      install rds /bin/false
+      blacklist rds
+      install sctp /bin/false
+      blacklist sctp
+
+mounts:
+  - [ "tmpfs", "/tmp",     "tmpfs", "defaults,rw,nosuid,nodev,noexec,relatime,size=2G", "0", "0" ]
+  - [ "tmpfs", "/dev/shm", "tmpfs", "defaults,rw,nosuid,nodev,noexec,relatime",         "0", "0" ]
+
+# Always runs late, so /etc paths exist and packages are present.
+runcmd:
+  - [ bash, -lc, "sed -ri 's|^GRUB_CMDLINE_LINUX=\"(.*)\"|GRUB_CMDLINE_LINUX=\"\\1 apparmor=1 security=apparmor audit=1 audit_backlog_limit=8192\"|' /etc/default/grub && sed -ri 's|  +| |g; s| \"|\"|g' /etc/default/grub && update-grub" ]
+  - [ bash, -lc, "systemctl enable --now apparmor" ]
+  - [ bash, -lc, "sysctl --system" ]
+  - [ bash, -lc, "find /etc/apparmor.d -maxdepth 1 -type f -exec aa-enforce {} \\; 2>/dev/null || true" ]
+  - [ bash, -lc, "systemctl disable --now systemd-timesyncd 2>/dev/null || true; systemctl enable --now chrony" ]
+  - [ bash, -lc, "systemctl enable --now auditd rsyslog" ]
+  - [ bash, -lc, "aideinit -y -f >/dev/null 2>&1 || true; [ -f /var/lib/aide/aide.db.new ] && mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db || true" ]
+  - [ bash, -lc, "ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp; ufw default deny incoming; ufw default allow outgoing; ufw allow in on lo; ufw allow out on lo; ufw deny in from 127.0.0.0/8; yes | ufw --force enable" ]
+  - [ bash, -lc, "chmod 600 /boot/grub/grub.cfg || true" ]
+
+power_state:
+  delay: "+1"
+  mode: reboot
+  message: "Rebooting to apply GRUB/auditd/AppArmor changes."
+  timeout: 60
+  condition: True

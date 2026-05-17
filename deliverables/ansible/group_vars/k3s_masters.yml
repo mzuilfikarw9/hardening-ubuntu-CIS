@@ -1,0 +1,17 @@
+---
+# group_vars/k3s_masters.yml
+# Overrides that apply to every host in the [k3s_masters] group across
+# environments.
+
+# Same reasoning as k3s_workers — masters also run the containerd
+# runtime and rely on overlayfs. See group_vars/k3s_workers.yml for the
+# full rationale.
+cis_modules_skip_unload:
+  - overlayfs
+
+# Masters run the kube-apiserver and embedded etcd but also schedule
+# pods (they're not tainted NoSchedule in this cluster). They need
+# ip_forward=1 for the same reason workers do. See k3s_workers.yml.
+cis_sysctl_overrides:
+  net.ipv4.ip_forward: 1
+  net.ipv6.conf.all.forwarding: 1

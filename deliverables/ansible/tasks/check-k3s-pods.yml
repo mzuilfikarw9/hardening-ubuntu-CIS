@@ -1,0 +1,18 @@
+---
+# tasks/check-k3s-pods.yml — No non-Running/non-Completed pods cluster-wide.
+# Waits up to ~5 min for pods to recover after a worker returns.
+
+- name: Wait for all pods to be Running/Completed
+  ansible.builtin.shell: |
+    set -o pipefail
+    kubectl get pods -A --no-headers \
+      | awk '$4 != "Running" && $4 != "Completed"' | wc -l
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ dr_k3s_probe_host }}"
+  register: _bad_pods
+  changed_when: false
+  until: _bad_pods.stdout | int == 0
+  retries: 20
+  delay: 15
+  become: true

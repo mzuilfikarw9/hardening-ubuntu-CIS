@@ -1,0 +1,487 @@
+---
+# preflight-check.yml — Read-only cluster-health report.
+#
+# Runs ONLY read/observe commands. Safe to execute any time, including
+# mid-rollout. Produces a pass/fail summary per tier so you can gate
+# the reboot: if anything is RED, DO NOT proceed with reboot-ha.yml.
+#
+# Usage:
+#   ansible-playbook -i inventories/dr.ini preflight-check.yml \
+#     --ask-vault-pass
+#
+# What it checks (DR topology):
+#   - SSH reachability on every host in the inventory
+#   - k3s:      all nodes Ready, no non-Running pods outside kube-system,
+#               etcd members healthy
+#   - MySQL GR: expected member count, all ONLINE, exactly one PRIMARY
+#   - Mongo:    rs.status() — all members PRIMARY/SECONDARY, no RECOVERING
+#   - RabbitMQ: cluster_status — all expected nodes in running_nodes
+#   - ProxySQL: runtime_mysql_servers — all ONLINE
+#   - HAProxy:  haproxy + keepalived active on both nodes; one VIP holder
+#
+# Exit code: non-zero if any check fails. Hook this into CI or a wrapper
+# script to block reboot-ha.yml when the fleet is unhealthy.
+
+# -----------------------------------------------------------------------------
+# Play 1: SSH reachability. Cheapest check — bail early if anything is down.
+# -----------------------------------------------------------------------------
+- name: Preflight — SSH reachability
+  hosts: dr
+  gather_facts: false
+  any_errors_fatal: false
+  tags: [ssh, quick]
+  tasks:
+    - name: Ping every host
+      ansible.builtin.ping:
+      register: ping_result
+      ignore_unreachable: true
+      ignore_errors: true
+
+    - name: Record reachability
+      ansible.builtin.set_fact:
+        preflight_ssh_ok: "{{ ping_result is success }}"
+
+- name: Preflight — SSH reachability summary
+  hosts: localhost
+  gather_facts: false
+  tags: [ssh, quick]
+  tasks:
+    - name: Collect unreachable hosts
+      ansible.builtin.set_fact:
+        unreachable_hosts: >-
+          {{ groups['dr']
+             | map('extract', hostvars)
+             | selectattr('preflight_ssh_ok', 'defined')
+             | rejectattr('preflight_ssh_ok')
+             | map(attribute='inventory_hostname')
+             | list }}
+
+    - name: Print SSH summary
+      ansible.builtin.debug:
+        msg: >-
+          SSH: {{ (groups['dr'] | length) - (unreachable_hosts | length) }}/{{ groups['dr'] | length }} reachable.
+          {% if unreachable_hosts %}UNREACHABLE: {{ unreachable_hosts | join(', ') }}{% endif %}
+
+    - name: Fail if any host is unreachable
+      ansible.builtin.fail:
+        msg: "{{ unreachable_hosts | length }} host(s) unreachable. Fix SSH/VPN before proceeding."
+      when: unreachable_hosts | length > 0
+
+# -----------------------------------------------------------------------------
+# Play 2: k3s cluster health (delegated to one master).
+# -----------------------------------------------------------------------------
+- name: Preflight — k3s cluster
+  # Run on the first k3s master in the inventory. Group-index syntax
+  # resolves at parse time (unlike "{{ dr_k3s_probe_host }}" which comes
+  # from group_vars/dr and isn't in scope until a host is selected).
+  hosts: k3s_masters[0]
+  gather_facts: false
+  tags: [k3s]
+  tasks:
+    - name: kubectl get nodes
+      ansible.builtin.command: kubectl get nodes --no-headers
+      changed_when: false
+      register: k3s_nodes
+      become: true
+
+    - name: Count NotReady nodes
+      ansible.builtin.set_fact:
+        k3s_not_ready: >-
+          {{ k3s_nodes.stdout_lines
+             | reject('search', ' Ready ')
+             | reject('search', '\\bReady\\b')
+             | list }}
+
+    - name: kubectl get pods -A (non-Running/non-Completed only)
+      # Single shot, no retries. The downstream filter task separates
+      # chronic known-broken pods (allowlisted in k3s_ignored_pod_patterns)
+      # from genuinely-new problems. If you hit a transient pod flap,
+      # re-run the preflight in 30-60s — that's cheaper than embedding a
+      # retry loop here (which conflicts with failed_when: false on
+      # until-exhaustion in newer Ansible).
+      ansible.builtin.shell: |
+        set -o pipefail
+        kubectl get pods -A --no-headers \
+          | awk '$4 != "Running" && $4 != "Completed"'
+      args:
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+      register: k3s_bad_pods_raw
+      become: true
+
+    - name: Separate ignored (known-broken) pods from real bad pods
+      ansible.builtin.set_fact:
+        k3s_ignored_bad_pods: >-
+          {{ k3s_bad_pods_raw.stdout_lines
+             | select('regex', '(' ~ (k3s_ignored_pod_patterns | join('|')) ~ ')')
+             | list if (k3s_ignored_pod_patterns | default([]) | length) > 0
+             else [] }}
+        k3s_bad_pods: >-
+          {{ k3s_bad_pods_raw.stdout_lines
+             | reject('regex', '(' ~ (k3s_ignored_pod_patterns | join('|')) ~ ')')
+             | list if (k3s_ignored_pod_patterns | default([]) | length) > 0
+             else k3s_bad_pods_raw.stdout_lines }}
+
+    - name: etcd member list (embedded etcd)
+      ansible.builtin.shell: |
+        set -o pipefail
+        kubectl get --raw='/livez?verbose' || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: k3s_livez
+      become: true
+
+    - name: Report k3s status
+      ansible.builtin.debug:
+        msg:
+          - "k3s nodes total: {{ k3s_nodes.stdout_lines | length }}"
+          - "k3s nodes NotReady: {{ k3s_not_ready | length }}"
+          - "k3s non-Running pods (real): {{ k3s_bad_pods | length }}"
+          - "k3s non-Running pods (ignored, known-broken): {{ k3s_ignored_bad_pods | length }}"
+          - "k3s ignored pod list: {{ k3s_ignored_bad_pods }}"
+          - "k3s /livez: {{ 'healthy' if 'livez check passed' in k3s_livez.stdout else 'see output' }}"
+
+    - name: Fail if k3s unhealthy
+      ansible.builtin.fail:
+        msg: >-
+          k3s unhealthy — NotReady nodes or NEW failing pods detected.
+          Bad pods: {{ k3s_bad_pods }}
+      when:
+        - (k3s_not_ready | length) > 0
+          or (k3s_bad_pods | length) > 0
+
+# -----------------------------------------------------------------------------
+# Play 3: MySQL Group Replication health.
+# -----------------------------------------------------------------------------
+- name: Preflight — MySQL Group Replication
+  hosts: mysql[0]
+  gather_facts: false
+  tags: [mysql]
+  vars:
+    _gr_query: >-
+      SELECT MEMBER_HOST, MEMBER_STATE, MEMBER_ROLE
+      FROM performance_schema.replication_group_members;
+  tasks:
+    - name: Query group_replication members
+      ansible.builtin.shell: |
+        MYSQL_PWD="{{ vault_mysql_password }}" mysql \
+          -u {{ vault_mysql_user }} -N -B \
+          -e "{{ _gr_query }}"
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: gr_members
+      no_log: true
+
+    - name: Compute GR health flags
+      # Match substrings against the tab-separated rows. MEMBER_STATE is
+      # the only field that contains ONLINE; MEMBER_ROLE is the only
+      # field that contains PRIMARY. So substring search is unambiguous
+      # and avoids the list-of-lists indexing that newer Jinja rejects.
+      ansible.builtin.set_fact:
+        gr_count: "{{ gr_members.stdout_lines | length }}"
+        gr_online: "{{ gr_members.stdout_lines | select('search', '\\bONLINE\\b') | list | length }}"
+        gr_primary: "{{ gr_members.stdout_lines | select('search', '\\bPRIMARY\\b') | list | length }}"
+
+    - name: Report MySQL GR
+      ansible.builtin.debug:
+        msg:
+          - "MySQL GR members: {{ gr_count }}/{{ mysql_gr_expected_members }} (expected)"
+          - "MySQL GR ONLINE:  {{ gr_online }}"
+          - "MySQL GR PRIMARY: {{ gr_primary }} (expect 1)"
+
+    - name: Fail if MySQL GR unhealthy
+      ansible.builtin.fail:
+        msg: "MySQL GR unhealthy — not all ONLINE or primary count wrong."
+      when:
+        - gr_count | int != mysql_gr_expected_members
+          or gr_online | int != mysql_gr_expected_members
+          or gr_primary | int != 1
+
+# -----------------------------------------------------------------------------
+# Play 4: MongoDB replica set health.
+# -----------------------------------------------------------------------------
+- name: Preflight — MongoDB rs0
+  hosts: mongo_rabbit[0]
+  gather_facts: false
+  tags: [mongo]
+  tasks:
+    - name: rs.status() — states
+      # `tail -1` grabs only the final line (the eval result). mongosh
+      # prints connection banners / deprecation warnings to stdout in
+      # some builds, which previously polluted the parsed output.
+      # `2>/dev/null` drops stderr noise. Explicit connection string
+      # avoids SRV discovery delays.
+      ansible.builtin.shell: |
+        set -o pipefail
+        mongosh --quiet mongodb://127.0.0.1:27017 \
+          -u '{{ vault_mongo_user }}' \
+          -p '{{ vault_mongo_password }}' \
+          --authenticationDatabase '{{ vault_mongo_auth_db }}' \
+          --eval 'rs.status().members.map(m => m.stateStr).join(",")' \
+          2>/dev/null | tail -1
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: mongo_states
+      no_log: true
+
+    - name: Parse states
+      ansible.builtin.set_fact:
+        mongo_state_list: "{{ mongo_states.stdout.strip().split(',') | reject('equalto', '') | list }}"
+
+    - name: Report MongoDB
+      ansible.builtin.debug:
+        msg:
+          - "Mongo rs0 raw output: '{{ mongo_states.stdout.strip() }}'"
+          - "Mongo rs0 members: {{ mongo_state_list | length }}/{{ mongo_rs_expected_members }}"
+          - "Mongo rs0 states:  {{ mongo_state_list | join(', ') }}"
+
+    - name: Fail if Mongo unhealthy
+      # Fail only if we have FEWER members than expected (indicates a
+      # member is missing / the cluster shrunk), or if any member is in
+      # a non-healthy state. Seeing more members than expected is
+      # noteworthy but not a go/no-go blocker — bump the expected count
+      # in group_vars and add the hosts to the inventory.
+      ansible.builtin.fail:
+        msg: >-
+          Mongo rs0 unhealthy —
+          members={{ mongo_state_list | length }} expected={{ mongo_rs_expected_members }},
+          states={{ mongo_state_list | join(',') }}
+      when:
+        - (mongo_state_list | length) < mongo_rs_expected_members
+          or (mongo_state_list
+               | reject('in', ['PRIMARY', 'SECONDARY', 'ARBITER'])
+               | list | length) > 0
+
+# -----------------------------------------------------------------------------
+# Play 5: RabbitMQ cluster status.
+# -----------------------------------------------------------------------------
+- name: Preflight — RabbitMQ cluster
+  hosts: mongo_rabbit[0]
+  gather_facts: false
+  tags: [rabbit]
+  tasks:
+    - name: rabbitmqctl cluster_status (JSON)
+      ansible.builtin.shell: |
+        rabbitmqctl -q cluster_status --formatter=json
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: rabbit_running_raw
+      become: true
+
+    - name: Parse cluster status
+      ansible.builtin.set_fact:
+        rabbit_cluster: "{{ rabbit_running_raw.stdout | from_json }}"
+
+    - name: Extract running node count
+      ansible.builtin.set_fact:
+        rabbit_running_count: "{{ rabbit_cluster.running_nodes | length }}"
+
+    - name: Report RabbitMQ
+      ansible.builtin.debug:
+        msg:
+          - "Rabbit running_nodes: {{ rabbit_running_count }}/{{ rabbit_expected_nodes }}"
+          - "Nodes: {{ rabbit_cluster.running_nodes | join(', ') }}"
+
+    - name: Fail if Rabbit missing nodes
+      ansible.builtin.fail:
+        msg: >-
+          RabbitMQ has {{ rabbit_running_count }} running nodes, expected
+          {{ rabbit_expected_nodes }}. Running: {{ rabbit_cluster.running_nodes | join(', ') }}
+      when: rabbit_running_count | int != rabbit_expected_nodes
+
+# -----------------------------------------------------------------------------
+# Play 6: ProxySQL backend health.
+# -----------------------------------------------------------------------------
+- name: Preflight — ProxySQL
+  hosts: proxysql[0]
+  gather_facts: false
+  tags: [proxysql]
+  tasks:
+    # no_log on the shell invocation (to keep credentials out of logs), but we
+    # scrub the output into a safe register immediately after so later tasks
+    # can display backend details on failure.
+    - name: Query runtime_mysql_servers
+      ansible.builtin.shell: |
+        MYSQL_PWD="{{ vault_proxysql_admin_password }}" mysql \
+          -h 127.0.0.1 -P 6032 \
+          -u {{ vault_proxysql_admin_user }} -N -B \
+          -e "SELECT hostgroup_id, hostname, status FROM runtime_mysql_servers;"
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: proxysql_backends
+      no_log: true
+
+    # The last tab-separated column is the status (ONLINE, SHUNNED,
+    # OFFLINE_SOFT, OFFLINE_HARD). We split each row and compare the
+    # last field for exact equality. Avoids regex/word-boundary pitfalls.
+    - name: Parse backend rows
+      ansible.builtin.set_fact:
+        proxysql_rows: "{{ proxysql_backends.stdout_lines }}"
+        proxysql_bad: "{{ proxysql_backends.stdout_lines | reject('search', 'ONLINE\\s*$') | list }}"
+
+    - name: Report ProxySQL
+      ansible.builtin.debug:
+        msg:
+          - "ProxySQL backends total: {{ proxysql_rows | length }}"
+          - "ProxySQL non-ONLINE:    {{ proxysql_bad | length }}"
+          - "All backends (hostgroup<TAB>host<TAB>status):"
+          - "{{ proxysql_rows }}"
+
+    - name: Fail if any backend is not ONLINE
+      ansible.builtin.fail:
+        msg: |
+          One or more ProxySQL backends are not ONLINE.
+
+          Non-ONLINE backends ({{ proxysql_bad | length }}):
+          {{ proxysql_bad | join('\n') }}
+
+          Valid ONLINE states are: ONLINE.
+          Other states (SHUNNED, OFFLINE_SOFT, OFFLINE_HARD) are failures.
+          Investigate with, on dr-proxysql-01:
+            mysql -h 127.0.0.1 -P 6032 -u admin -p \
+              -e "SELECT * FROM runtime_mysql_servers;"
+            mysql -h 127.0.0.1 -P 6032 -u admin -p \
+              -e "SELECT * FROM mysql_server_connect_log ORDER BY time_start_us DESC LIMIT 10;"
+      when: (proxysql_bad | length) > 0
+
+# -----------------------------------------------------------------------------
+# Play 7: HAProxy + keepalived.
+# -----------------------------------------------------------------------------
+- name: Preflight — HAProxy & keepalived
+  hosts: haproxy
+  gather_facts: false
+  tags: [haproxy]
+  tasks:
+    - name: haproxy active?
+      ansible.builtin.command: systemctl is-active haproxy
+      changed_when: false
+      failed_when: false
+      register: haproxy_active
+      become: true
+
+    - name: keepalived active?
+      ansible.builtin.command: systemctl is-active keepalived
+      changed_when: false
+      failed_when: false
+      register: keepalived_active
+      become: true
+
+    - name: Does this node hold the VIP?
+      ansible.builtin.shell: |
+        ip -4 -o addr show | grep -q '172.16.202.35' && echo yes || echo no
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: vip_holder
+
+    - name: Report HAProxy/keepalived status
+      ansible.builtin.debug:
+        msg:
+          - "haproxy:    {{ haproxy_active.stdout }}"
+          - "keepalived: {{ keepalived_active.stdout }}"
+          - "holds VIP 172.16.202.35: {{ vip_holder.stdout }}"
+
+    - name: Fail if haproxy/keepalived not active
+      ansible.builtin.fail:
+        msg: "haproxy or keepalived not active on {{ inventory_hostname }}."
+      when:
+        - haproxy_active.stdout != 'active'
+          or keepalived_active.stdout != 'active'
+
+- name: Preflight — VIP holder summary
+  hosts: localhost
+  gather_facts: false
+  tags: [haproxy]
+  # -----------------------------------------------------------------------------
+  # VIP check is ADVISORY ONLY by default.
+  #
+  # Apr 19 2026: investigation confirmed DR's "HAProxy HA pair"
+  # (dr-haprox-01 / dr-haprox-02) is actually a single VM with two IPs
+  # aliased on one NIC (eth0=172.16.202.11, eth0:1=172.16.202.12,
+  # same /etc/machine-id). keepalived.conf names 172.16.202.12 as the
+  # virtual_ipaddress, but that's a static secondary already bound to the
+  # interface, not a floating VIP. There is no real failover target on DR.
+  # See audit-findings/DR-HAProxy-HA-topology.md for details.
+  #
+  # We keep the check here so the same preflight works on prod (which may
+  # have a real pair), but set enforce_vip_check=false by default so DR
+  # runs don't block on this pre-existing drift. Override on the command
+  # line with `-e enforce_vip_check=true` when running against prod.
+  # -----------------------------------------------------------------------------
+  vars:
+    enforce_vip_check: false
+  tasks:
+    - name: Build per-host VIP status map
+      ansible.builtin.set_fact:
+        vip_status_per_host: >-
+          {{ dict(groups['haproxy']
+               | zip(groups['haproxy']
+                 | map('extract', hostvars, ['vip_holder', 'stdout'])
+                 | map('default', 'UNKNOWN')
+                 | list)) }}
+
+    - name: Count VIP holders
+      ansible.builtin.set_fact:
+        vip_holders: >-
+          {{ vip_status_per_host
+             | dict2items
+             | selectattr('value', 'equalto', 'yes')
+             | map(attribute='key')
+             | list }}
+
+    - name: Report VIP holder
+      ansible.builtin.debug:
+        msg:
+          - "VIP 172.16.202.35 per-host check:"
+          - "{{ vip_status_per_host }}"
+          - "Holders: {{ vip_holders | join(', ') or 'NONE' }}"
+          - "enforce_vip_check={{ enforce_vip_check }} (advisory on DR, set true for prod)"
+
+    - name: WARN if VIP not held by exactly one node (advisory mode)
+      ansible.builtin.debug:
+        msg: |
+          ⚠ VIP holder count is {{ vip_holders | length }}, expected 1.
+          This is recorded as a pre-existing finding on DR (see
+          audit-findings/DR-HAProxy-HA-topology.md). Not a hardening issue.
+          Re-run with -e enforce_vip_check=true to treat as failure (e.g. prod).
+      when:
+        - (vip_holders | length) != 1
+        - not (enforce_vip_check | bool)
+
+    - name: Fail if VIP is not held by exactly one node (enforced mode)
+      ansible.builtin.fail:
+        msg: |
+          Expected exactly one VIP holder for 172.16.202.35, got {{ vip_holders | length }}.
+
+          Per-host check: {{ vip_status_per_host }}
+
+          If BOTH show 'no': keepalived has no master — check
+            sudo systemctl status keepalived
+            sudo journalctl -u keepalived -n 50
+          on both haproxy nodes.
+
+          If BOTH show 'yes': split-brain — immediately stop keepalived on
+          the node that should NOT be master (usually the BACKUP per
+          /etc/keepalived/keepalived.conf priority setting).
+      when:
+        - (vip_holders | length) != 1
+        - enforce_vip_check | bool
+
+# -----------------------------------------------------------------------------
+# Final banner.
+# -----------------------------------------------------------------------------
+- name: Preflight — all checks passed
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Print green-light banner
+      ansible.builtin.debug:
+        msg: >-
+          ALL PREFLIGHT CHECKS PASSED. Safe to proceed with reboot-ha.yml
+          once you and the approver confirm the maintenance window.

@@ -1,0 +1,20 @@
+---
+# group_vars/all.yml
+# Defaults that apply to EVERY host in every inventory, including the
+# implicit `localhost` used by the safety-gate play in reboot-ha.yml.
+#
+# Env-specific overrides (e.g. group_vars/dr/main.yml) take precedence —
+# these are only the fallback values. If you change a value here, sweep
+# group_vars/<env>/main.yml to make sure you're not shadowing yourself.
+
+# ---- Reboot window controls ----
+# Tripwire: if the whole reboot run passes this many minutes, remaining
+# tiers are skipped and we defer to the next weekly window. Matches the
+# "T+40 min stop" agreement with the CTO. Override per run with
+#   -e reboot_tripwire_minutes=60
+reboot_tripwire_minutes: 40
+
+# Per-host sanity waits after a reboot. Tuned conservatively; override
+# per-tier if needed.
+reboot_connect_timeout: 60         # max seconds to wait for SSH to return
+reboot_service_settle_seconds: 30  # post-SSH grace period before health checks

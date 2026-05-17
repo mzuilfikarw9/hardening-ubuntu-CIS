@@ -1,0 +1,19 @@
+---
+# tasks/check-rabbit.yml — Wait for RabbitMQ cluster to reach full size.
+# Uses rabbitmqctl on the probe node (Erlang cookie must match across DR).
+
+- name: rabbitmqctl cluster_status (JSON)
+  ansible.builtin.shell: |
+    rabbitmqctl -q cluster_status --formatter=json
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ dr_rabbit_probe_host }}"
+  register: _rabbit_raw
+  changed_when: false
+  become: true
+  until: >-
+    _rabbit_raw.stdout is defined
+    and (_rabbit_raw.stdout | from_json).running_nodes is defined
+    and ((_rabbit_raw.stdout | from_json).running_nodes | length) == rabbit_expected_nodes
+  retries: 20
+  delay: 15

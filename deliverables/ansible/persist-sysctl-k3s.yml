@@ -1,0 +1,19 @@
+---
+- name: Persist CIS sysctl on k3s tier (surgical)
+  hosts: k3s_masters:k3s_workers
+  become: true
+  gather_facts: true
+  vars_files:
+    - roles/cis_hardening/defaults/main.yml
+  tasks:
+    - name: Deploy CIS sysctl drop-in
+      ansible.builtin.template:
+        src: roles/cis_hardening/templates/60-cis.conf.j2
+        dest: /etc/sysctl.d/60-cis.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: apply sysctl
+  handlers:
+    - name: apply sysctl
+      ansible.builtin.command: sysctl --system

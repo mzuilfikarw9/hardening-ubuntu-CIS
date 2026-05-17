@@ -1,0 +1,74 @@
+---
+# tasks/main.yml \u2014 orchestrates all CIS hardening task files for Ubuntu 22/24.
+
+- name: Assert supported OS
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution == "Ubuntu"
+      - ansible_distribution_version in ["22.04", "24.04"]
+    fail_msg: "This role only supports Ubuntu 22.04 or 24.04. Got {{ ansible_distribution }} {{ ansible_distribution_version }}."
+
+- name: Detect cloud-init presence
+  ansible.builtin.stat:
+    path: /usr/bin/cloud-init
+  register: _cloudinit_bin
+
+- name: Set cloudinit_active fact
+  ansible.builtin.set_fact:
+    cloudinit_active: "{{ _cloudinit_bin.stat.exists and cis_cloudinit_managed }}"
+
+- name: 1.1 Kernel module hardening
+  ansible.builtin.include_tasks: kernel_modules.yml
+  tags: [section1, kernel_modules]
+
+- name: 1.1 Mount options
+  ansible.builtin.include_tasks: mount_options.yml
+  tags: [section1, mounts]
+
+- name: 1.2 Package updates and mandatory access control
+  ansible.builtin.include_tasks: updates_apparmor.yml
+  tags: [section1, apparmor, updates]
+
+- name: 1.4/1.5 Bootloader and process hardening
+  ansible.builtin.include_tasks: process_hardening.yml
+  tags: [section1, process_hardening]
+
+- name: 1.7 Warning banners
+  ansible.builtin.include_tasks: banners.yml
+  tags: [section1, banners]
+
+- name: 2 Services
+  ansible.builtin.include_tasks: services.yml
+  tags: [section2, services]
+
+- name: 3 Network parameters
+  ansible.builtin.include_tasks: network.yml
+  tags: [section3, network]
+
+- name: 4 Firewall
+  ansible.builtin.include_tasks: firewall.yml
+  tags: [section4, firewall]
+
+- name: 5.1 SSH
+  ansible.builtin.include_tasks: ssh.yml
+  tags: [section5, ssh]
+
+- name: 5.2 Sudo
+  ansible.builtin.include_tasks: sudo.yml
+  tags: [section5, sudo]
+
+- name: 5.3 PAM / password / faillock
+  ansible.builtin.include_tasks: pam.yml
+  tags: [section5, pam]
+
+- name: 5.4 User environment
+  ansible.builtin.include_tasks: users.yml
+  tags: [section5, users]
+
+- name: 6 Logging and auditing
+  ansible.builtin.include_tasks: logging_audit.yml
+  tags: [section6, logging, audit]
+
+- name: 7 File permissions
+  ansible.builtin.include_tasks: file_perms.yml
+  tags: [section7, file_perms]
